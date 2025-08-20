@@ -1,0 +1,19 @@
+[project]
+name = "sreyas-hello"
+version = "0.1.0"
+description = "Say hello from the command line"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[project.scripts]
+sreyas-hello = "sreyas_hello:main"
+
+[build-system]
+requires = ["uv_build>=0.8.12,<0.9.0"]
+build-backend = "uv_build"
+
+[[tool.uv.index]]
+name = "testpypi"
+url = "https://test.pypi.org/simple/"
+publish-url = "https://test.pypi.org/legacy/"
