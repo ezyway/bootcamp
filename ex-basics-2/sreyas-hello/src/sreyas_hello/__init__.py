@@ -1,4 +1,11 @@
+import sys
+from rich.console import Console
+
 def main() -> None:
-    import sys
+    console = Console()
+    
     who = sys.argv[1] if len(sys.argv) > 1 else "world"
-    print(f"hello, {who}")
+    
+    console.print(f"Hello, [bold red]{who}[/bold red]")
+    # OR
+    console.print(f"Hello, {who}", style='underline blue')
