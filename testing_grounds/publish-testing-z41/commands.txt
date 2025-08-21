@@ -1,0 +1,15 @@
+  338  cd testing_grounds/
+  339  uv init --package publish-testing-z41
+  340  cd publish-testing-z41/
+  341  code .
+  342  /usr/bin/python3 /home/azzlol/dev/aganitha/github/bootcamp/testing_grounds/publish-testing-z41/src/publish_testing_z41/__init__.py
+  343  ls
+  344  ls -a
+  345  uv run publish_testing_z41
+  346  uv run
+  347  uv run publish-testing-z41
+  348  source /home/azzlol/dev/aganitha/github/bootcamp/testing_grounds/publish-testing-z41/.venv/bin/activate
+  349  uv run publish-testing-z41
+  350  uv build
+  351  uv publish --publish-url https://test.pypi.org/legacy/
+  352  history
