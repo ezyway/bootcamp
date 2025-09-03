@@ -1,0 +1,43 @@
+services:
+  web:
+    image: nginx:1.29
+    container_name: webserver
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+    networks:
+      - mynet
+    ports:
+      - "8080:80"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost/ || exit 1"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  curl:
+    # image: ubuntu:24.04
+    image: curlimages/curl:8.5.0
+    container_name: curl
+    volumes:
+      - ./output:/output:rw
+    
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - mynet
+    
+    command: |
+      sh -c '
+      until curl --retry 10 --retry-delay 1 --retry-connrefused \
+        -s http://webserver/index.html -o /output/op.txt; do
+        echo "Waiting for webserver..."
+        sleep 1
+      done
+      echo 'Output from op.txt:'
+      cat /output/op.txt'
+
+networks:
+  mynet:
+    driver: bridge

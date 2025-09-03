@@ -1,0 +1,22 @@
+version: '3.9'
+
+services:
+  ubuntu24:
+    image: ubuntu:24.04
+    container_name: ubuntu24
+    command: sleep infinity   # keeps container running
+    networks:
+      - mynet
+
+  nginx:
+    image: nginx:latest
+    container_name: nginx
+    volumes:
+      - ./html:/usr/share/nginx/html:ro
+    ports:
+      - "8888:80"
+    networks:
+      - mynet
+
+networks:
+  mynet:
