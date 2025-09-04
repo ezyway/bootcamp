@@ -25,7 +25,7 @@ pip install .
 Transform a text file by specifying the input file, processing mode, and optionally an output file.
 
 ```bash
-python -m dataflow_framework.cli input.txt --mode uppercase --output output.txt
+uv run cli.py input.txt --mode uppercase --output output.txt
 ```
 
 ### Examples
@@ -33,13 +33,13 @@ python -m dataflow_framework.cli input.txt --mode uppercase --output output.txt
 Convert to uppercase:
 
 ```bash
-python -m dataflow_framework.cli input.txt --mode uppercase
+uv run cli.py input.txt --mode uppercase
 ```
 
 Convert to snake\_case:
 
 ```bash
-python -m dataflow_framework.cli input.txt --mode snakecase --output result.txt
+uv run cli.py input.txt --mode snakecase --output result.txt
 ```
 
 If no `--output` is provided, results are printed to the console.
@@ -79,7 +79,7 @@ You can easily add new processors:
 Now you can run:
 
 ```bash
-python -m dataflow_framework.cli input.txt --mode titlecase
+uv run cli.py input.txt --mode titlecase
 ```
 
 ---
@@ -108,7 +108,7 @@ Hello World
 Python Rocks
 
 # Run transformation
-python -m dataflow_framework.cli input.txt --mode snakecase --output output.txt
+uv run cli.py input.txt --mode snakecase --output output.txt
 
 # Output: output.txt
 hello_world
