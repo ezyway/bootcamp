@@ -1,3 +1,0 @@
-pipeline:
-  - type: processors.snake.to_snakecase
-  - type: processors.upper.to_uppercase

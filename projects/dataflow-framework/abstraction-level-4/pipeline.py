@@ -1,23 +1,33 @@
 import yaml
 import importlib
-from typing import Any
-from typez import ProcessorFn
+from typing import Any, Iterator
+from processors.base import ProcessorFn
 
 def load_function(import_path: str) -> ProcessorFn:
-    """Dynamically import a function from a dotted path like 'processors.upper.to_uppercase'."""
+    """
+    Dynamically import a processor from a dotted path like:
+    - 'processors.upper.upper_processor' (streamified function)
+    - 'processors.base.LineCounter' (stateful class)
+    """
     try:
-        module_path, func_name = import_path.rsplit(".", 1)
+        module_path, name = import_path.rsplit(".", 1)
         module = importlib.import_module(module_path)
-        fn = getattr(module, func_name)
+        obj = getattr(module, name)
     except (ValueError, ImportError, AttributeError) as e:
         raise ImportError(f"Could not import processor '{import_path}': {e}") from e
 
-    if not callable(fn):
+    # If it's a class, instantiate it
+    if isinstance(obj, type):
+        obj = obj()
+    # Ensure it's callable
+    if not callable(obj):
         raise TypeError(f"Processor '{import_path}' is not callable")
-    return fn
+    return obj
 
 def get_pipeline(config_path: str) -> list[ProcessorFn]:
-    """Load pipeline steps from YAML config file."""
+    """
+    Load a list of processors from a YAML config file. Each processor must be callable: Iterator[str] -> Iterator[str]
+    """
     with open(config_path, "r") as f:
         config: dict[str, Any] = yaml.safe_load(f)
 

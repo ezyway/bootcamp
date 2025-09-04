@@ -1,14 +1,19 @@
 import os
 from typing import Iterator, Optional
 from pipeline import get_pipeline
-from core import process_lines
 
 def read_lines(path: str) -> Iterator[str]:
+    """Lazily read lines from a file, stripping newlines."""
     with open(path, "r") as file:
         for line in file:
             yield line.rstrip("\n")
 
 def write_output(lines: Iterator[str], output_file: Optional[str]) -> None:
+    """
+    Write or print processed lines.
+        write_output(iter(["a", "b"]), None)  # prints "a" then "b"
+        write_output(iter(["a", "b"]), "out.txt")  # writes to file
+    """
     if output_file is None:
         for line in lines:
             print(line)
@@ -20,7 +25,17 @@ def write_output(lines: Iterator[str], output_file: Optional[str]) -> None:
                 file.write(line + "\n")
 
 def run(input_path: str, config_path: str, output_path: Optional[str]) -> None:
-    lines = read_lines(input_path)
+    """
+    Run the stream-based pipeline:
+    1. Read input as iterator
+    2. Pass through each processor
+    3. Write output
+    """
+    lines: Iterator[str] = read_lines(input_path)
     processors = get_pipeline(config_path)
-    transformed = process_lines(lines, processors)
-    write_output(transformed, output_path)
+
+    # Apply processors sequentially (streaming)
+    for processor in processors:
+        lines = processor(lines)
+
+    write_output(lines, output_path)
