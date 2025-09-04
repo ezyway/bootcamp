@@ -1,17 +1,11 @@
-# processors/fanout.py
-from typing import Iterator
-from .base import ProcessorFn
+from typing import Iterator, Tuple, List
 
 class SplitLines:
-    """
-    Split each line by a delimiter and emit multiple lines.
-    Example:
-        "apple,banana,pear" -> "apple", "banana", "pear"
-    """
-    def __init__(self, delimiter: str = ","):
+    def __init__(self, delimiter: str = ",", tag: str = "split"):
         self.delimiter = delimiter
+        self.tag = tag
 
-    def __call__(self, lines: Iterator[str]) -> Iterator[str]:
+    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
         for line in lines:
             for part in line.split(self.delimiter):
-                yield part.strip()
+                yield [self.tag], part.strip()

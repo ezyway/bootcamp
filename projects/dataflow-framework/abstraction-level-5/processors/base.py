@@ -1,25 +1,19 @@
-from typing import Iterator, Callable
+from typing import Iterator, Callable, Tuple, List
 
-ProcessorFn = Callable[[Iterator[str]], Iterator[str]]
+ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[List[str], str]]]
 
-def streamify(fn: Callable[[str], str]) -> ProcessorFn:
-    """
-    Wrap a simple str->str function to work on a stream of lines.
-    """
-    def wrapper(lines: Iterator[str]) -> Iterator[str]:
+def streamify(fn: Callable[[str], str], tag: str = "default") -> ProcessorFn:
+    def wrapper(lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
         for line in lines:
-            yield fn(line)
+            yield [tag], fn(line)
     return wrapper
 
 class LineCounter:
-    """
-    Stateful processor that counts lines seen and emits a tuple:
-    "<line_number>: <line>"
-    """
-    def __init__(self):
+    def __init__(self, tag: str = "default"):
         self.count = 0
+        self.tag = tag
 
-    def __call__(self, lines: Iterator[str]) -> Iterator[str]:
+    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
         for line in lines:
             self.count += 1
-            yield f"{self.count}: {line}"
+            yield [self.tag], f"{self.count}: {line}"

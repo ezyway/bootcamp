@@ -1,6 +1,24 @@
-pipeline:
-  # - type: processors.fanout.SplitLines       # split lines on comma 
-  # - type: processors.snake.snake_processor   # convert spaces to underscores
-  # - type: processors.upper.upper_processor   # convert to uppercase
-  # - type: processors.fanin.JoinEveryTwoLines # join every 2 lines
-  - type: processors.base.LineCounter        # prepend line numbers
+nodes:
+  - name: split_lines
+    type: processors.fanout.SplitLines
+    routes:
+      split: snake_case
+
+  - name: snake_case
+    type: processors.snake.snake_processor
+    routes:
+      snake: to_upper
+
+  - name: to_upper
+    type: processors.upper.upper_processor
+    routes:
+      uppercase: join_lines
+
+  - name: join_lines
+    type: processors.fanin.JoinEveryTwoLines
+    routes:
+      joined: count_lines
+
+  - name: count_lines
+    type: processors.base.LineCounter
+    routes: {}

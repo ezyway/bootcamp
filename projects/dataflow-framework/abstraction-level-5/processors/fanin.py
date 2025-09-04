@@ -1,23 +1,17 @@
-# processors/fanin.py
-from typing import Iterator
-from .base import ProcessorFn
+from typing import Iterator, Tuple, List
 
 class JoinEveryTwoLines:
-    """
-    Join every N lines into one output line.
-    Example: join 2 lines:
-        ["a", "b", "c", "d"] -> ["a b", "c d"]
-    """
-    def __init__(self, n: int = 2, sep: str = " "):
+    def __init__(self, n: int = 2, sep: str = " ", tag: str = "joined"):
         self.n = n
         self.sep = sep
+        self.tag = tag
 
-    def __call__(self, lines: Iterator[str]) -> Iterator[str]:
+    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
         buffer = []
         for line in lines:
             buffer.append(line)
             if len(buffer) == self.n:
-                yield self.sep.join(buffer)
+                yield [self.tag], self.sep.join(buffer)
                 buffer = []
         if buffer:
-            yield self.sep.join(buffer)
+            yield [self.tag], self.sep.join(buffer)
