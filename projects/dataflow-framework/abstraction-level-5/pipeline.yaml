@@ -1,0 +1,6 @@
+pipeline:
+  # - type: processors.fanout.SplitLines       # split lines on comma 
+  # - type: processors.snake.snake_processor   # convert spaces to underscores
+  # - type: processors.upper.upper_processor   # convert to uppercase
+  # - type: processors.fanin.JoinEveryTwoLines # join every 2 lines
+  - type: processors.base.LineCounter        # prepend line numbers
