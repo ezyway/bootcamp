@@ -1,9 +1,1 @@
-ex-basics-1/sreyas-hello/src/sreyas_hello/__pycache__/
-ex-basics-2/sreyas-hello/src/sreyas_hello/__pycache__/
-ex-basics-3/sreyas-hello/src/sreyas_hello/__pycache__/
-projects/dataflow-framework/abstraction-level-2/__pycache__/cli.cpython-313.pyc
-projects/dataflow-framework/abstraction-level-2/__pycache__/core.cpython-313.pyc
-projects/dataflow-framework/abstraction-level-2/__pycache__/main.cpython-313.pyc
-projects/dataflow-framework/abstraction-level-2/__pycache__/pipeline.cpython-313.pyc
-projects/dataflow-framework/abstraction-level-2/__pycache__/typez.cpython-313.pyc
-projects/dataflow-framework/abstraction-level-2/__pycache__/types.cpython-313.pyc
+*.pyc
