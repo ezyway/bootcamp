@@ -1,9 +1,7 @@
 import yaml
 import importlib
-from typing import Any, Iterator, Callable, Iterable, Tuple
-
-# Each processor now yields list of tags + line
-ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[list[str], str]]]
+from typing import Any, Iterator, Callable, Iterable, Tuple, List
+from typez import ProcessorFn
 
 def load_function(import_path: str) -> ProcessorFn:
     module_path, name = import_path.rsplit(".", 1)
@@ -42,13 +40,12 @@ def build_dag(config_path: str) -> dict[str, DAGNode]:
     return nodes
 
 def run_dag(start_node: DAGNode, lines: Iterable[str]) -> Iterator[str]:
-    # Each element: (tags, line)
-    pending: list[Tuple[list[str], str, DAGNode]] = [( ["default"], line, start_node) for line in lines ]
+    # Each element: (tags, line, node)
+    pending: list[Tuple[List[str], str, DAGNode]] = [( ["start"], line, start_node) for line in lines ]
 
     while pending:
         tags, line, node = pending.pop(0)
         for out_tags, out_line in node.processor(iter([line])):
-            # Fan-out by tags
             next_nodes = set()
             for tag in out_tags:
                 if tag in node.routes:
@@ -57,7 +54,8 @@ def run_dag(start_node: DAGNode, lines: Iterable[str]) -> Iterator[str]:
                 for next_node_name in next_nodes:
                     next_node = next((n for n in node.output_nodes if n.name == next_node_name), None)
                     if next_node:
-                        pending.append((["default"], out_line, next_node))
+                        # forward emitted tags
+                        pending.append((out_tags, out_line, next_node))
             else:
-                # No route, yield as final output
+                # No matching route -> output
                 yield out_line

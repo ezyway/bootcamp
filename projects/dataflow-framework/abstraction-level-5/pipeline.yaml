@@ -1,3 +1,4 @@
+start: split_lines   # <-- new field
 nodes:
   - name: split_lines
     type: processors.fanout.SplitLines
