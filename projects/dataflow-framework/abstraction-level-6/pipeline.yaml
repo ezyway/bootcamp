@@ -1,19 +1,28 @@
 start: start
+
 nodes:
   - tag: start
-    type: core.trim
-
-  - tag: trimmed
-    type: processors.taggers.Tagger
+    type: processors.tagger.Tagger
+    routes:
+      - error
+      - warn
+      - trimmed
 
   - tag: error
-    type: core.to_uppercase
+    type: core.ToUppercase
+    routes:
+      - end
+
+  - tag: trimmed
+    type: core.Trim
+    routes:
+      - end
 
   - tag: warn
-    type: core.to_snakecase
-
-  - tag: general
-    type: core.to_uppercase
+    type: core.ToSnakecase
+    routes:
+      - end
 
   - tag: end
-    type: processors.output.terminal
+    type: processors.output.Terminal
+    routes: []

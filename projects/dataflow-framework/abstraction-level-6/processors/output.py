@@ -1,8 +1,7 @@
 from typing import Iterator, Tuple, List
-from typez import ProcessorFn
+from processors.base import BaseProcessor
 
-class terminal:
-    """Terminal processor that emits 'end' for all lines."""
-    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+class Terminal(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
         for line in lines:
-            yield (["end"], line)
+            yield ["end"], line
