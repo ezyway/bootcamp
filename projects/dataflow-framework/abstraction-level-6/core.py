@@ -1,23 +1,21 @@
-from typing import Iterable
+from typing import Iterator, Tuple, List
 from typez import ProcessorFn
 
-
-def to_uppercase(line: str) -> str:
-    return line.upper()
-
-
-def to_snakecase(line: str) -> str:
-    return line.replace(" ", "_").lower()
-
-
-def apply_processors(line: str, processors: list[ProcessorFn]) -> str:
-    """Apply all processors in sequence to a single line."""
-    for processor in processors:
-        line = processor(line)
-    return line
-
-
-def process_lines(lines: Iterable[str], processors: list[ProcessorFn]) -> Iterable[str]:
-    """Yield processed lines one by one."""
+def to_uppercase(lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+    """
+    Convert lines to uppercase and emit them with 'end' tag.
+    """
     for line in lines:
-        yield apply_processors(line, processors)
+        yield (["end"], line.upper())
+
+def to_snakecase(lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+    """
+    Convert lines to snake_case and emit them with 'end' tag.
+    """
+    for line in lines:
+        yield (["end"], line.replace(" ", "_").lower())
+
+def trim(lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+    """Trim whitespace and emit lines with 'trimmed' tag."""
+    for line in lines:
+        yield (["trimmed"], line.strip())

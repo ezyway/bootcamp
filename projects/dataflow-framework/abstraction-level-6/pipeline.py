@@ -1,63 +1,64 @@
 import yaml
 import importlib
-from typing import Any, Iterator, Callable, Iterable, Tuple
+from typing import Any, Iterator, Tuple, List, Dict
+from typez import ProcessorFn
 
-# Each processor now yields list of tags + line
-ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[list[str], str]]]
+class ProcessorNode:
+    """
+    Represents a processor state. Processes lines and emits (tag, line) pairs.
+    """
+    def __init__(self, tag: str, processor: ProcessorFn):
+        self.tag = tag
+        self.processor = processor
 
 def load_function(import_path: str) -> ProcessorFn:
+    """
+    Dynamically load a processor function or callable class.
+    """
     module_path, name = import_path.rsplit(".", 1)
     module = importlib.import_module(module_path)
     obj = getattr(module, name)
-
     if isinstance(obj, type):
         obj = obj()
     if not callable(obj):
         raise TypeError(f"Processor '{import_path}' is not callable")
-    
     return obj
 
-class DAGNode:
-    def __init__(self, name: str, processor: ProcessorFn, routes: dict[str, str]):
-        self.name = name
-        self.processor = processor
-        self.routes = routes  # tag -> downstream node name
-        self.output_nodes: list[DAGNode] = []
-
-def build_dag(config_path: str) -> dict[str, DAGNode]:
+def build_routing(config_path: str) -> Dict[str, ProcessorNode]:
+    """
+    Build a tag-based routing map from YAML config.
+    """
     with open(config_path, "r") as f:
         config: dict[str, Any] = yaml.safe_load(f)
 
-    nodes: dict[str, DAGNode] = {}
+    nodes: Dict[str, ProcessorNode] = {}
     for node_cfg in config.get("nodes", []):
-        name = node_cfg["name"]
+        tag = node_cfg["tag"]
         processor = load_function(node_cfg["type"])
-        routes = node_cfg.get("routes", {})
-        nodes[name] = DAGNode(name, processor, routes)
-
-    # Connect nodes
-    for node in nodes.values():
-        node.output_nodes = [nodes[tgt] for tgt in node.routes.values() if tgt in nodes]
-
+        nodes[tag] = ProcessorNode(tag, processor)
+    
     return nodes
 
-def run_dag(start_node: DAGNode, lines: Iterable[str]) -> Iterator[str]:
-    # Each element: (tags, line)
-    pending: list[Tuple[list[str], str, DAGNode]] = [( ["default"], line, start_node) for line in lines ]
+def run_router(start_tag: str, lines: Iterator[str], nodes: Dict[str, ProcessorNode]) -> Iterator[str]:
+    """
+    Routes lines dynamically based on tags until 'end' is emitted.
+    """
+    from collections import deque
 
+    # Each item: (current_tag, line)
+    pending = deque([(start_tag, line) for line in lines])
+    
     while pending:
-        tags, line, node = pending.pop(0)
-        for out_tags, out_line in node.processor(iter([line])):
-            # Fan-out by tags
-            next_nodes = set()
-            for tag in out_tags:
-                if tag in node.routes:
-                    next_nodes.add(node.routes[tag])
-            if next_nodes:
-                for next_node_name in next_nodes:
-                    next_node = next((n for n in node.output_nodes if n.name == next_node_name), None)
-                    if next_node:
-                        pending.append((["default"], out_line, next_node))
-            else:
-                # No route, yield as final output
-                yield out_line
+        tag, line = pending.popleft()
+        if tag == "end":
+            yield line
+            continue
+
+        if tag not in nodes:
+            raise KeyError(f"No processor registered for tag '{tag}'")
+        
+        processor_node = nodes[tag]
+        for out_tags, out_line in processor_node.processor(iter([line])):
+            # Fan-out: multiple output tags
+            for out_tag in out_tags:
+                pending.append((out_tag, out_line))

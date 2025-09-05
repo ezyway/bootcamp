@@ -1,24 +1,19 @@
+start: start
 nodes:
-  - name: split_lines
-    type: processors.fanout.SplitLines
-    routes:
-      split: snake_case
+  - tag: start
+    type: core.trim
 
-  - name: snake_case
-    type: processors.snake.snake_processor
-    routes:
-      snake: to_upper
+  - tag: trimmed
+    type: processors.taggers.Tagger
 
-  - name: to_upper
-    type: processors.upper.upper_processor
-    routes:
-      uppercase: join_lines
+  - tag: error
+    type: core.to_uppercase
 
-  - name: join_lines
-    type: processors.fanin.JoinEveryTwoLines
-    routes:
-      joined: count_lines
+  - tag: warn
+    type: core.to_snakecase
 
-  - name: count_lines
-    type: processors.base.LineCounter
-    routes: {}
+  - tag: general
+    type: core.to_uppercase
+
+  - tag: end
+    type: processors.output.terminal

@@ -1,3 +1,4 @@
-from typing import Callable
+from typing import Iterator, Tuple, List, Callable
 
-ProcessorFn = Callable[[str], str]
+# Each processor takes an iterator of lines and yields (tags, line) pairs
+ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[List[str], str]]]
