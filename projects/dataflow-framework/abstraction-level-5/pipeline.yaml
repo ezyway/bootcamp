@@ -1,25 +1,30 @@
-start: split_lines   # <-- new field
+start: trim
 nodes:
-  - name: split_lines
-    type: processors.fanout.SplitLines
+  - name: trim
+    type: core.trim
     routes:
-      split: snake_case
+      trimmed: classify
 
-  - name: snake_case
-    type: processors.snake.snake_processor
+  - name: classify
+    type: processors.taggers.TagError
     routes:
-      snake: to_upper
+      error: handle_error
+      general: check_warn
 
-  - name: to_upper
-    type: processors.upper.upper_processor
+  - name: check_warn
+    type: processors.taggers.TagWarn
     routes:
-      uppercase: join_lines
+      warn: handle_warning
+      general: handle_general
 
-  - name: join_lines
-    type: processors.fanin.JoinEveryTwoLines
-    routes:
-      joined: count_lines
+  - name: handle_error
+    type: core.to_uppercase
+    routes: {}
 
-  - name: count_lines
-    type: processors.base.LineCounter
+  - name: handle_warning
+    type: core.to_snakecase
+    routes: {}
+
+  - name: handle_general
+    type: core.to_uppercase
     routes: {}
