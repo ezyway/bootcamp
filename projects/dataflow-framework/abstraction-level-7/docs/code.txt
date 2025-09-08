@@ -140,10 +140,11 @@ class DashboardServer:
                 "version": "1.0.0",
                 "description": "Real-time observability dashboard",
                 "endpoints": {
-                    "stats": "/stats - Processor statistics",
-                    "trace": "/trace - Line traces through the DAG",
+                    "stats": "/stats - Processor statistics with memory metrics",
+                    "trace": "/trace - Enhanced line traces with search and filtering",
                     "errors": "/errors - Recent error logs",
-                    "health": "/health - Service health check",
+                    "processors": "/processors - List all processors with status",
+                    "health": "/health - Service health check with memory stats",
                     "dashboard": "/dashboard - HTML dashboard"
                 },
                 "trace_enabled": self.metrics_store.trace_enabled,
@@ -152,9 +153,11 @@ class DashboardServer:
         
         @self.app.get("/stats")
         async def get_stats():
-            """Get current processor statistics."""
+            """Get current processor statistics with memory metrics."""
             try:
                 stats = self.metrics_store.get_stats()
+                memory_stats = self.metrics_store.get_memory_stats()
+                
                 total_lines = sum(p.get("count", 0) for p in stats.values())
                 total_errors = sum(p.get("errors", 0) for p in stats.values())
                 total_time = sum(p.get("total_time", 0.0) for p in stats.values())
@@ -162,12 +165,15 @@ class DashboardServer:
                 return JSONResponse(content={
                     "timestamp": time.time(),
                     "processors": stats,
+                    "memory": memory_stats,
                     "summary": {
                         "total_processors": len(stats),
                         "total_lines_processed": total_lines,
                         "total_errors": total_errors,
                         "total_processing_time": round(total_time, 4),
-                        "avg_processing_time": round(total_time / max(total_lines, 1), 6)
+                        "avg_processing_time": round(total_time / max(total_lines, 1), 6),
+                        "memory_usage_mb": memory_stats.get("current_memory_mb", 0),
+                        "memory_growth_mb": memory_stats.get("memory_growth_mb", 0)
                     }
                 })
             except Exception as e:
@@ -175,17 +181,31 @@ class DashboardServer:
         
         @self.app.get("/trace")
         async def get_trace(
-            limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of traces to return")
+            limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of traces to return"),
+            search: str = Query(default="", description="Search in trace content"),
+            processor: str = Query(default="", description="Filter by processor name"),
+            tag: str = Query(default="", description="Filter by output tag")
         ):
-            """Get recent line traces."""
+            """Get recent line traces with enhanced search and filtering."""
             try:
-                traces = self.metrics_store.get_traces(limit=limit)
+                traces = self.metrics_store.get_traces(
+                    limit=limit, 
+                    search=search, 
+                    processor_filter=processor,
+                    tag_filter=tag
+                )
+                
                 return JSONResponse(content={
                     "timestamp": time.time(),
                     "traces": traces,
                     "total_traces": len(traces),
                     "trace_enabled": self.metrics_store.trace_enabled,
-                    "limit": limit
+                    "filters": {
+                        "limit": limit,
+                        "search": search,
+                        "processor": processor,
+                        "tag": tag
+                    }
                 })
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error retrieving traces: {str(e)}")
@@ -206,17 +226,58 @@ class DashboardServer:
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error retrieving errors: {str(e)}")
         
+        @self.app.get("/processors")
+        async def get_processors():
+            """Get list of all processors with their status and basic metrics."""
+            try:
+                processors = self.metrics_store.get_processors()
+                stats = self.metrics_store.get_stats()
+                
+                # Enrich processor data with detailed metrics
+                enriched_processors = []
+                for proc in processors:
+                    proc_name = proc["name"]
+                    if proc_name in stats:
+                        detailed_metrics = stats[proc_name]
+                        proc.update({
+                            "total_time": detailed_metrics.get("total_time", 0.0),
+                            "memory_usage_mb": detailed_metrics.get("memory_usage_mb", 0.0)
+                        })
+                    enriched_processors.append(proc)
+                
+                return JSONResponse(content={
+                    "timestamp": time.time(),
+                    "processors": enriched_processors,
+                    "total_processors": len(enriched_processors),
+                    "active_processors": len([p for p in enriched_processors if p["status"] == "active"]),
+                    "idle_processors": len([p for p in enriched_processors if p["status"] == "idle"])
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving processors: {str(e)}")
+        
         @self.app.get("/health")
         async def health_check():
-            """Health check endpoint."""
-            stats = self.metrics_store.get_stats()
-            return {
-                "status": "healthy",
-                "timestamp": time.time(),
-                "trace_enabled": self.metrics_store.trace_enabled,
-                "active_processors": len(stats),
-                "uptime_seconds": time.time() - getattr(self, '_start_time', time.time())
-            }
+            """Enhanced health check endpoint with memory statistics."""
+            try:
+                stats = self.metrics_store.get_stats()
+                memory_stats = self.metrics_store.get_memory_stats()
+                
+                return {
+                    "status": "healthy",
+                    "timestamp": time.time(),
+                    "trace_enabled": self.metrics_store.trace_enabled,
+                    "active_processors": len(stats),
+                    "uptime_seconds": time.time() - getattr(self, '_start_time', time.time()),
+                    "memory": memory_stats,
+                    "system_health": {
+                        "memory_usage_ok": memory_stats.get("memory_percent", 0) < 90,
+                        "active_traces": len(self.metrics_store._active_traces) if hasattr(self.metrics_store, '_active_traces') else 0,
+                        "stored_traces": len(self.metrics_store.traces),
+                        "stored_errors": len(self.metrics_store.errors)
+                    }
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error in health check: {str(e)}")
         
         @self.app.get("/dashboard", response_class=HTMLResponse)
         async def get_dashboard(request: Request):
@@ -245,7 +306,7 @@ class DashboardServer:
     
     def is_running(self) -> bool:
         """Check if the dashboard server is running."""
-        return self.server_thread is not None and self.server_thread.is_alive()
+        return hasattr(self, 'server_thread') and self.server_thread is not None and self.server_thread.is_alive()
 
 # Convenience functions for backwards compatibility
 def create_dashboard(metrics_store: Optional[MetricsStore] = None) -> DashboardServer:
@@ -474,7 +535,8 @@ def run_legacy(input_path: str, config_path: str, output_path: Optional[str]) ->
     run(input_path, config_path, output_path)
 
 
-metrics.pyimport threading
+metrics.py
+import threading
 import time
 import traceback
 from collections import deque, defaultdict
@@ -758,7 +820,6 @@ class MetricsStore:
             self._line_counter = 0
 
 
-
 pipeline.py
 # pipeline.py
 import yaml
@@ -878,9 +939,17 @@ def run_router(start_tag: str, lines: Iterator[str], nodes: Dict[str, ProcessorN
         tag, line, hops, line_id = pending.popleft()
         
         if tag == "end":
-            # Complete the trace if we have a line_id
+            # Complete the trace if we have a line_id - FIXED VERSION
             if line_id and metrics_store.trace_enabled:
-                metrics_store.add_trace_step(line_id, "end")
+                # Provide all required parameters for enhanced add_trace_step
+                metrics_store.add_trace_step(
+                    line_id=line_id,
+                    processor_tag="end",
+                    input_content=line,
+                    output_content=line,
+                    output_tags=["end"],
+                    processing_time=0.0
+                )
                 metrics_store.complete_trace(line_id, line)
             
             total_lines_processed += 1
@@ -982,15 +1051,30 @@ templates/dashboard.html
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
-        .container { max-width: 1200px; margin: 0 auto; }
+        .container { max-width: 1400px; margin: 0 auto; }
         .card { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
         .header { background: #2c3e50; color: white; text-align: center; }
         .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
         .stat-item { background: #ecf0f1; padding: 15px; border-radius: 5px; }
-        .error-item { background: #e74c3c; color: white; padding: 10px; margin: 5px 0; border-radius: 5px; }
-        .trace-item { background: #3498db; color: white; padding: 10px; margin: 5px 0; border-radius: 5px; }
-        pre { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 5px; overflow-x: auto; }
+        .memory-item { background: #f39c12; color: white; padding: 15px; border-radius: 5px; }
+        .error-item { background: #e74c3c; color: white; padding: 10px; margin: 5px 0; border-radius: 5px; font-size: 14px; }
+        .trace-item { background: #3498db; color: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .trace-detail { background: rgba(255,255,255,0.2); margin: 8px 0; padding: 8px; border-radius: 3px; font-size: 13px; }
+        .trace-step { background: rgba(255,255,255,0.1); margin: 4px 0; padding: 6px; border-radius: 3px; font-size: 12px; }
+        .processor-item { background: #27ae60; color: white; padding: 12px; margin: 5px 0; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; }
+        .processor-idle { background: #95a5a6; }
+        .search-controls { background: #34495e; color: white; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
+        .search-input { width: 100%; padding: 8px; margin: 5px 0; border: none; border-radius: 3px; }
+        .filter-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+        .filter-input { flex: 1; min-width: 150px; padding: 6px; border: none; border-radius: 3px; }
+        .search-btn { background: #27ae60; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .clear-btn { background: #e74c3c; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
         .refresh-btn { background: #27ae60; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        .tag-badge { background: rgba(255,255,255,0.3); padding: 2px 6px; margin: 2px; border-radius: 10px; font-size: 11px; display: inline-block; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px; }
+        .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-active { background-color: #2ecc71; }
+        .status-idle { background-color: #bdc3c7; }
     </style>
 </head>
 <body>
@@ -1002,110 +1086,254 @@ templates/dashboard.html
         </div>
         
         <div class="card">
-            <h2>Quick Stats</h2>
+            <h2>System Overview</h2>
             <div id="quick-stats">Loading...</div>
         </div>
         
         <div class="card">
-            <h2>Processor Details</h2>
+            <h2>Memory Usage</h2>
+            <div id="memory-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Active Processors</h2>
+            <div id="processor-list">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Processor Performance</h2>
             <div id="processor-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Enhanced Trace Search</h2>
+            <div class="search-controls">
+                <input type="text" id="search-input" class="search-input" placeholder="Search in trace content (input, output, steps)...">
+                <div class="filter-row">
+                    <input type="text" id="processor-filter" class="filter-input" placeholder="Filter by processor">
+                    <input type="text" id="tag-filter" class="filter-input" placeholder="Filter by tag">
+                    <input type="number" id="limit-input" class="filter-input" value="10" min="1" max="100" placeholder="Limit">
+                    <button class="search-btn" onclick="searchTraces()">Search</button>
+                    <button class="clear-btn" onclick="clearFilters()">Clear</button>
+                </div>
+            </div>
+            <div id="trace-logs">Loading...</div>
         </div>
         
         <div class="card">
             <h2>Recent Errors</h2>
             <div id="error-logs">Loading...</div>
         </div>
-        
-        <div class="card">
-            <h2>Recent Traces</h2>
-            <div id="trace-logs">Loading...</div>
-        </div>
     </div>
     
     <script>
+        let currentFilters = {
+            search: '',
+            processor: '',
+            tag: '',
+            limit: 10
+        };
+
         async function loadData() {
             try {
-                // Load stats
-                const statsResponse = await fetch('/stats');
-                const statsData = await statsResponse.json();
-                
-                document.getElementById('quick-stats').innerHTML = `
-                    <div class="stats-grid">
-                        <div class="stat-item"><strong>Total Processors:</strong> ${statsData.summary.total_processors}</div>
-                        <div class="stat-item"><strong>Lines Processed:</strong> ${statsData.summary.total_lines_processed}</div>
-                        <div class="stat-item"><strong>Total Errors:</strong> ${statsData.summary.total_errors}</div>
-                        <div class="stat-item"><strong>Avg Processing Time:</strong> ${statsData.summary.avg_processing_time}s</div>
-                    </div>
-                `;
-                
-                let processorHtml = '<div class="stats-grid">';
-                Object.entries(statsData.processors).forEach(([name, stats]) => {
-                    processorHtml += `
-                        <div class="stat-item">
-                            <strong>${name}</strong><br>
-                            Count: ${stats.count}<br>
-                            Avg Time: ${stats.avg_time.toFixed(4)}s<br>
-                            Errors: ${stats.errors}
-                        </div>
-                    `;
-                });
-                processorHtml += '</div>';
-                document.getElementById('processor-stats').innerHTML = processorHtml;
-                
-                // Load errors
-                const errorsResponse = await fetch('/errors?limit=10');
-                const errorsData = await errorsResponse.json();
-                
-                let errorHtml = '';
-                if (errorsData.errors.length === 0) {
-                    errorHtml = '<p>No recent errors</p>';
-                } else {
-                    errorsData.errors.forEach(error => {
-                        const timestamp = new Date(error.timestamp * 1000).toLocaleString();
-                        errorHtml += `
-                            <div class="error-item">
-                                <strong>${error.processor}</strong> - ${timestamp}<br>
-                                ${error.message}
-                            </div>
-                        `;
-                    });
-                }
-                document.getElementById('error-logs').innerHTML = errorHtml;
-                
-                // Load traces
-                const tracesResponse = await fetch('/trace?limit=10');
-                const tracesData = await tracesResponse.json();
-                
-                let traceHtml = '';
-                if (!tracesData.trace_enabled) {
-                    traceHtml = '<p>Tracing is disabled. Use --trace flag to enable.</p>';
-                } else if (tracesData.traces.length === 0) {
-                    traceHtml = '<p>No traces available</p>';
-                } else {
-                    tracesData.traces.forEach(trace => {
-                        const timestamp = new Date(trace.timestamp * 1000).toLocaleString();
-                        traceHtml += `
-                            <div class="trace-item">
-                                <strong>${trace.line_id}</strong> - ${timestamp}<br>
-                                Path: ${trace.path.join(' → ')}<br>
-                                Time: ${trace.total_time.toFixed(4)}s
-                            </div>
-                        `;
-                    });
-                }
-                document.getElementById('trace-logs').innerHTML = traceHtml;
-                
+                await Promise.all([
+                    loadStats(),
+                    loadProcessors(),
+                    loadTraces(),
+                    loadErrors()
+                ]);
             } catch (error) {
                 console.error('Error loading dashboard data:', error);
                 document.getElementById('quick-stats').innerHTML = '<p>Error loading data. Check console for details.</p>';
             }
         }
+
+        async function loadStats() {
+            const statsResponse = await fetch('/stats');
+            const statsData = await statsResponse.json();
+            
+            // System Overview
+            document.getElementById('quick-stats').innerHTML = `
+                <div class="stats-grid">
+                    <div class="stat-item"><strong>Total Processors:</strong> ${statsData.summary.total_processors}</div>
+                    <div class="stat-item"><strong>Lines Processed:</strong> ${statsData.summary.total_lines_processed}</div>
+                    <div class="stat-item"><strong>Total Errors:</strong> ${statsData.summary.total_errors}</div>
+                    <div class="stat-item"><strong>Avg Processing Time:</strong> ${statsData.summary.avg_processing_time}s</div>
+                </div>
+            `;
+
+            // Memory Stats
+            if (statsData.memory) {
+                document.getElementById('memory-stats').innerHTML = `
+                    <div class="stats-grid">
+                        <div class="memory-item"><strong>Current Memory:</strong> ${statsData.memory.current_memory_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Growth:</strong> ${statsData.memory.memory_growth_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Usage:</strong> ${statsData.memory.memory_percent.toFixed(1)}%</div>
+                        <div class="memory-item"><strong>Peak Memory:</strong> ${statsData.memory.peak_memory_mb.toFixed(1)} MB</div>
+                    </div>
+                `;
+            }
+
+            // Processor Performance
+            let processorHtml = '<div class="stats-grid">';
+            Object.entries(statsData.processors).forEach(([name, stats]) => {
+                const memUsage = stats.memory_usage_mb ? stats.memory_usage_mb.toFixed(1) : '0.0';
+                processorHtml += `
+                    <div class="stat-item">
+                        <strong>${name}</strong><br>
+                        Count: ${stats.count}<br>
+                        Avg Time: ${stats.avg_time.toFixed(4)}s<br>
+                        Errors: ${stats.errors}<br>
+                        Memory: ${memUsage} MB
+                    </div>
+                `;
+            });
+            processorHtml += '</div>';
+            document.getElementById('processor-stats').innerHTML = processorHtml;
+        }
+
+        async function loadProcessors() {
+            try {
+                const processorsResponse = await fetch('/processors');
+                const processorsData = await processorsResponse.json();
+                
+                let processorHtml = '';
+                processorsData.processors.forEach(processor => {
+                    const statusClass = processor.status === 'active' ? 'processor-item' : 'processor-item processor-idle';
+                    const statusIndicator = processor.status === 'active' ? 'status-active' : 'status-idle';
+                    const memUsage = processor.memory_usage_mb ? processor.memory_usage_mb.toFixed(1) : '0.0';
+                    
+                    processorHtml += `
+                        <div class="${statusClass}">
+                            <div>
+                                <span class="status-indicator ${statusIndicator}"></span>
+                                <strong>${processor.name}</strong>
+                                <div style="font-size: 12px; margin-top: 4px;">
+                                    ${processor.count} lines • ${processor.avg_time.toFixed(4)}s avg • ${processor.errors} errors • ${memUsage} MB
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div>${processor.status.toUpperCase()}</div>
+                                <div style="font-size: 11px;">${processor.last_seen ? new Date(processor.last_seen * 1000).toLocaleTimeString() : 'Never'}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                document.getElementById('processor-list').innerHTML = processorHtml;
+            } catch (error) {
+                document.getElementById('processor-list').innerHTML = '<p>Processor list not available</p>';
+            }
+        }
+
+        async function loadTraces() {
+            const params = new URLSearchParams();
+            if (currentFilters.search) params.append('search', currentFilters.search);
+            if (currentFilters.processor) params.append('processor', currentFilters.processor);
+            if (currentFilters.tag) params.append('tag', currentFilters.tag);
+            params.append('limit', currentFilters.limit.toString());
+
+            const tracesResponse = await fetch(`/trace?${params}`);
+            const tracesData = await tracesResponse.json();
+            
+            let traceHtml = '';
+            if (!tracesData.trace_enabled) {
+                traceHtml = '<p>Tracing is disabled. Use --trace flag to enable.</p>';
+            } else if (tracesData.traces.length === 0) {
+                traceHtml = '<p>No traces match your search criteria</p>';
+            } else {
+                tracesData.traces.forEach(trace => {
+                    const timestamp = new Date(trace.start_timestamp * 1000).toLocaleString();
+                    
+                    let stepsHtml = '';
+                    if (trace.steps && trace.steps.length > 0) {
+                        trace.steps.forEach(step => {
+                            const stepTags = step.output_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ');
+                            stepsHtml += `
+                                <div class="trace-step">
+                                    <strong>${step.processor}</strong> (${(step.processing_time * 1000).toFixed(2)}ms)<br>
+                                    Input: "${step.input_content}"<br>
+                                    Output: "${step.output_content}"<br>
+                                    Tags: ${stepTags}
+                                </div>
+                            `;
+                        });
+                    }
+                    
+                    const allTags = trace.all_tags ? trace.all_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ') : '';
+                    
+                    traceHtml += `
+                        <div class="trace-item">
+                            <div><strong>${trace.line_id}</strong> - ${timestamp}</div>
+                            <div class="trace-detail">
+                                <strong>Original:</strong> "${trace.original_content}"<br>
+                                <strong>Final:</strong> "${trace.final_content}"<br>
+                                <strong>Path:</strong> ${trace.path.join(' → ')}<br>
+                                <strong>All Tags:</strong> ${allTags}<br>
+                                <strong>Total Time:</strong> ${(trace.total_time * 1000).toFixed(2)}ms
+                            </div>
+                            ${stepsHtml ? `<div><strong>Processing Steps:</strong>${stepsHtml}</div>` : ''}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('trace-logs').innerHTML = traceHtml;
+        }
+
+        async function loadErrors() {
+            const errorsResponse = await fetch('/errors?limit=10');
+            const errorsData = await errorsResponse.json();
+            
+            let errorHtml = '';
+            if (errorsData.errors.length === 0) {
+                errorHtml = '<p>No recent errors</p>';
+            } else {
+                errorsData.errors.forEach(error => {
+                    const timestamp = new Date(error.timestamp * 1000).toLocaleString();
+                    const lineContent = error.line_content ? `<br><strong>Line:</strong> "${error.line_content}"` : '';
+                    errorHtml += `
+                        <div class="error-item">
+                            <strong>${error.processor}</strong> - ${timestamp}<br>
+                            ${error.message}${lineContent}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('error-logs').innerHTML = errorHtml;
+        }
+
+        function searchTraces() {
+            currentFilters.search = document.getElementById('search-input').value;
+            currentFilters.processor = document.getElementById('processor-filter').value;
+            currentFilters.tag = document.getElementById('tag-filter').value;
+            currentFilters.limit = parseInt(document.getElementById('limit-input').value) || 10;
+            loadTraces();
+        }
+
+        function clearFilters() {
+            currentFilters = { search: '', processor: '', tag: '', limit: 10 };
+            document.getElementById('search-input').value = '';
+            document.getElementById('processor-filter').value = '';
+            document.getElementById('tag-filter').value = '';
+            document.getElementById('limit-input').value = '10';
+            loadTraces();
+        }
+
+        // Enable Enter key for search
+        document.addEventListener('DOMContentLoaded', function() {
+            ['search-input', 'processor-filter', 'tag-filter'].forEach(id => {
+                document.getElementById(id).addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        searchTraces();
+                    }
+                });
+            });
+        });
         
         // Load data on page load
         loadData();
         
-        // Auto-refresh every 5 seconds
-        setInterval(loadData, 5000);
+        // Auto-refresh every 10 seconds (increased due to more complex data)
+        setInterval(loadData, 10000);
     </script>
 </body>
 </html>
@@ -1148,20 +1376,38 @@ class BaseProcessor:
                 # Start tracing for this line if enabled
                 if self.metrics_store.trace_enabled:
                     line_id = self.metrics_store.start_trace(line)
-                    self.metrics_store.add_trace_step(line_id, self.processor_tag)
                 
                 # Process the single line
                 single_line_iter = iter([line])
-                results = list(self.process(single_line_iter))
-                
-                # Yield all results
+                results = []
+
+                # Process and collect outputs to add detailed trace steps
+                for tags, processed_line in self.process(single_line_iter):
+                    end_time = time.time()
+                    processing_time = end_time - start_time
+                    results.append((tags, processed_line))
+
+                    # If tracing enabled, add detailed step info
+                    if self.metrics_store.trace_enabled and line_id:
+                        self.metrics_store.add_trace_step(
+                            line_id=line_id,
+                            processor_tag=self.processor_tag,
+                            input_content=line,
+                            output_content=processed_line,
+                            output_tags=tags,
+                            processing_time=processing_time
+                        )
+
+                # Yield after adding all trace steps
                 for tags, processed_line in results:
                     yield tags, processed_line
                     
-                    # Complete trace for the final output
-                    if self.metrics_store.trace_enabled and line_id:
-                        self.metrics_store.complete_trace(line_id, processed_line)
-                        
+                # Complete trace for the final output
+                if self.metrics_store.trace_enabled and line_id and results:
+                    # Use last processed line content
+                    final_content = results[-1][1]
+                    self.metrics_store.complete_trace(line_id, final_content)
+                    
             except Exception as e:
                 success = False
                 
@@ -1217,16 +1463,6 @@ def streamify(fn, tag: str = "default"):
     return StatelessProcessor()
 
 
-processors/output.py
-from typing import Iterator, Tuple, List
-from processors.base import BaseProcessor
-
-class Terminal(BaseProcessor):
-    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
-        for line in lines:
-            yield ["end"], line
-
-
 processors/tagger.py
 from typing import Iterator, Tuple, List
 from processors.base import BaseProcessor
@@ -1240,4 +1476,3 @@ class Tagger(BaseProcessor):
                 yield ["warn"], line
             else:
                 yield ["trimmed"], line
-
