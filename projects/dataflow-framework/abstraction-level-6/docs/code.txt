@@ -1,0 +1,324 @@
+cli.py
+import typer
+from typing_extensions import Annotated
+from dotenv import load_dotenv
+
+from main import run
+
+load_dotenv()
+app = typer.Typer(help="Run a DAG-based line processing pipeline.")
+
+@app.command()
+def main(
+    input: Annotated[str, typer.Argument()],
+    config: Annotated[
+        str,
+        typer.Option(help="Path to DAG pipeline config file (YAML). Defaults to pipeline.yaml."),
+    ] = "pipeline.yaml",
+    output: Annotated[
+        str | None,
+        typer.Option(help="Specify output file. If not specified, prints to console."),
+    ] = None,
+):
+    """
+    Run a DAG pipeline on input lines. Each processor can yield tagged lines, which
+    are routed according to the DAG config.
+    """
+    run(input, config, output)
+
+if __name__ == "__main__":
+    app()
+
+
+core.py
+from typing import Iterator, Tuple, List
+from processors.base import BaseProcessor
+
+class ToUppercase(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "ERROR: " + line.upper()
+
+class ToSnakecase(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "WARN: " + line.replace(" ", "_").lower()
+
+class Trim(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "INFO: " + line.strip()
+
+
+main.py
+import os
+from typing import Iterator, Optional
+from pipeline import build_routing, run_router
+
+def read_lines(path: str) -> Iterator[str]:
+    """Read lines from a file, stripping newlines."""
+    with open(path, "r") as file:
+        for line in file:
+            yield line.rstrip("\n")
+
+def write_output(lines: Iterator[str], output_file: Optional[str]) -> None:
+    """Write lines to a file or print to console if output_file is None."""
+    if output_file is None:
+        for line in lines:
+            print(line)
+    else:
+        output_file = os.path.abspath(os.path.expanduser(output_file))
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, "w") as file:
+            for line in lines:
+                file.write(line + "\n")
+
+def run(input_path: str, config_path: str, output_path: Optional[str]) -> None:
+    """Run the tag-based routing engine on input lines."""
+    lines = read_lines(input_path)
+    nodes = build_routing(config_path)
+
+    import yaml
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+    start_tag = cfg.get("start", "start")
+
+    output_lines = run_router(start_tag, lines, nodes)
+    write_output(output_lines, output_path)
+
+
+pipeline.py
+# pipeline.py
+import yaml
+import importlib
+from typing import Any, Iterator, Tuple, List, Dict
+from typez import ProcessorFn
+
+import networkx as nx
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+class ProcessorNode:
+    def __init__(self, tag: str, processor: ProcessorFn):
+        self.tag = tag
+        self.processor = processor
+        self.graph: nx.DiGraph | None = None  # optional graph reference
+
+def load_function(import_path: str) -> ProcessorFn:
+    module_path, name = import_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    obj = getattr(module, name)
+    if isinstance(obj, type):
+        obj = obj()
+    if not callable(obj):
+        raise TypeError(f"Processor '{import_path}' is not callable")
+    return obj
+
+def build_routing(config_path: str) -> Dict[str, ProcessorNode]:
+    with open(config_path, "r") as f:
+        config: dict[str, Any] = yaml.safe_load(f)
+
+    nodes: Dict[str, ProcessorNode] = {}
+    for node_cfg in config.get("nodes", []):
+        tag = node_cfg["tag"]
+        processor = load_function(node_cfg["type"])
+        nodes[tag] = ProcessorNode(tag, processor)
+    
+    if "start" not in nodes:
+        raise ValueError("Config must include a 'start' node")
+    if "end" not in nodes:
+        raise ValueError("Config must include an 'end' node")
+
+    graph = nx.DiGraph()
+    for tag in nodes:
+        graph.add_node(tag)
+
+    for node_cfg in config.get("nodes", []):
+        tag = node_cfg["tag"]
+        for out_tag in node_cfg.get("routes", []):
+            if out_tag not in nodes and out_tag != "end":
+                raise KeyError(f"Node '{tag}' declares route to unknown tag '{out_tag}'")
+            graph.add_edge(tag, out_tag)
+
+    unreachable = set(nodes) - set(nx.descendants(graph, "start")) - {"start"}
+    if unreachable:
+        print(f"Warning: unreachable nodes from 'start': {unreachable}")
+
+    try:
+        cycles = list(nx.find_cycle(graph, orientation="original"))
+        if cycles:
+            print(f"Warning: detected cycles in routing graph: {cycles}")
+    except nx.exception.NetworkXNoCycle:
+        pass
+
+    for node in nodes.values():
+        node.graph = graph
+
+    return nodes
+
+def visualize_routing(nodes: Dict[str, ProcessorNode], title: str = "Routing Graph", output_file: str | None = None) -> None:
+    """
+    Visualize the routing graph using networkx and matplotlib.
+    If output_file is provided, saves the figure instead of showing it.
+    """
+    any_node = next(iter(nodes.values()))
+    graph = any_node.graph
+    if graph is None:
+        print("No graph available for visualization.")
+        return
+
+    plt.figure(figsize=(8, 6))
+    pos = nx.spring_layout(graph)
+    nx.draw(graph, pos, with_labels=True, node_color="skyblue", node_size=2000, edge_color="gray", arrowsize=20)
+    plt.title(title)
+
+    if output_file:
+        plt.savefig(output_file)
+        print(f"Graph saved to {output_file}")
+    else:
+        plt.show()
+
+
+def run_router(start_tag: str, lines: Iterator[str], nodes: Dict[str, ProcessorNode], max_hops: int = 1000) -> Iterator[str]:
+    from collections import deque
+
+    pending = deque([(start_tag, line, 0) for line in lines])
+    while pending:
+        tag, line, hops = pending.popleft()
+        if tag == "end":
+            yield line
+            continue
+
+        if hops > max_hops:
+            raise RuntimeError(f"Line exceeded max hops ({max_hops}) for tag '{tag}'. Possible infinite loop.")
+
+        if tag not in nodes:
+            raise KeyError(f"Line routed to unknown tag '{tag}'. Please check processor output or config.")
+
+        processor_node = nodes[tag]
+        for out_tags, out_line in processor_node.processor(iter([line])):
+            # Validate processor output
+            if not isinstance(out_tags, list):
+                raise TypeError(f"Processor '{tag}' must yield a list of tags, got {type(out_tags).__name__}")
+            if not out_tags:
+                raise ValueError(f"Processor '{tag}' yielded an empty list of tags. Each line must have at least one tag.")
+
+            for out_tag in out_tags:
+                if out_tag not in nodes and out_tag != "end":
+                    raise KeyError(f"Processor '{tag}' emitted unknown tag '{out_tag}'. Add it to config.")
+                pending.append((out_tag, out_line, hops + 1))
+
+
+typez.py
+from typing import Iterator, Tuple, List, Callable
+
+# Each processor takes an iterator of lines and yields (tags, line) pairs
+ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[List[str], str]]]
+
+
+visualize.py
+from pipeline import build_routing, visualize_routing
+
+nodes = build_routing("pipeline.yaml")
+visualize_routing(nodes, output_file="routing_graph.png")
+
+
+processors/base.py
+from typing import Iterator, Tuple, List
+
+class BaseProcessor:
+    """
+    Base class for all processors.
+    Provides a consistent interface and optional internal state.
+    """
+    def __init__(self):
+        self.state = {}
+
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        """
+        Override this in subclasses.
+        Yield (tags, line) tuples for next routing step.
+        """
+        raise NotImplementedError
+
+    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        return self.process(lines)
+
+# Example: LineCounter using standardized BaseProcessor
+class LineCounter(BaseProcessor):
+    def __init__(self, tag: str = "default"):
+        super().__init__()
+        self.state["count"] = 0
+        self.tag = tag
+
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            self.state["count"] += 1
+            yield [self.tag], f"{self.state['count']}: {line}"
+
+# Example: Streamify helper for stateless functions
+def streamify(fn, tag: str = "default"):
+    """
+    Wraps a stateless function into a BaseProcessor-compatible callable.
+    """
+    class StatelessProcessor(BaseProcessor):
+        def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+            for line in lines:
+                yield [tag], fn(line)
+    return StatelessProcessor()
+
+
+processors/tagger.py
+from typing import Iterator, Tuple, List
+from processors.base import BaseProcessor
+
+class Tagger(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            if "ERROR" in line:
+                yield ["error"], line
+            elif "WARN" in line:
+                yield ["warn"], line
+            else:
+                yield ["trimmed"], line
+
+
+processors/output.py
+from typing import Iterator, Tuple, List
+from processors.base import BaseProcessor
+
+class Terminal(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], line
+
+
+pipeline.yaml
+start: start
+nodes:
+  - tag: start
+    type: processors.tagger.Tagger
+    routes:
+      - error
+      - warn
+      - trimmed
+
+  - tag: error
+    type: core.ToUppercase
+    routes:
+      - end
+
+  - tag: trimmed
+    type: core.Trim
+    routes:
+      - end
+
+  - tag: warn
+    type: core.ToSnakecase
+    routes:
+      - end
+
+  - tag: end
+    type: processors.output.Terminal
+    routes: []
