@@ -1,0 +1,294 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DAG Pipeline Dashboard</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: #2c3e50; color: white; text-align: center; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+        .stat-item { background: #ecf0f1; padding: 15px; border-radius: 5px; }
+        .memory-item { background: #f39c12; color: white; padding: 15px; border-radius: 5px; }
+        .error-item { background: #e74c3c; color: white; padding: 10px; margin: 5px 0; border-radius: 5px; font-size: 14px; }
+        .trace-item { background: #3498db; color: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .trace-detail { background: rgba(255,255,255,0.2); margin: 8px 0; padding: 8px; border-radius: 3px; font-size: 13px; }
+        .trace-step { background: rgba(255,255,255,0.1); margin: 4px 0; padding: 6px; border-radius: 3px; font-size: 12px; }
+        .processor-item { background: #27ae60; color: white; padding: 12px; margin: 5px 0; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; }
+        .processor-idle { background: #95a5a6; }
+        .search-controls { background: #34495e; color: white; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
+        .search-input { width: 100%; padding: 8px; margin: 5px 0; border: none; border-radius: 3px; }
+        .filter-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+        .filter-input { flex: 1; min-width: 150px; padding: 6px; border: none; border-radius: 3px; }
+        .search-btn { background: #27ae60; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .clear-btn { background: #e74c3c; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .refresh-btn { background: #27ae60; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        .tag-badge { background: rgba(255,255,255,0.3); padding: 2px 6px; margin: 2px; border-radius: 10px; font-size: 11px; display: inline-block; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px; }
+        .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-active { background-color: #2ecc71; }
+        .status-idle { background-color: #bdc3c7; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card header">
+            <h1>DAG Pipeline Dashboard</h1>
+            <p>Real-time observability for your processing pipeline</p>
+            <button class="refresh-btn" onclick="location.reload()">Refresh Data</button>
+        </div>
+        
+        <div class="card">
+            <h2>System Overview</h2>
+            <div id="quick-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Memory Usage</h2>
+            <div id="memory-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Active Processors</h2>
+            <div id="processor-list">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Processor Performance</h2>
+            <div id="processor-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Enhanced Trace Search</h2>
+            <div class="search-controls">
+                <input type="text" id="search-input" class="search-input" placeholder="Search in trace content (input, output, steps)...">
+                <div class="filter-row">
+                    <input type="text" id="processor-filter" class="filter-input" placeholder="Filter by processor">
+                    <input type="text" id="tag-filter" class="filter-input" placeholder="Filter by tag">
+                    <input type="number" id="limit-input" class="filter-input" value="10" min="1" max="100" placeholder="Limit">
+                    <button class="search-btn" onclick="searchTraces()">Search</button>
+                    <button class="clear-btn" onclick="clearFilters()">Clear</button>
+                </div>
+            </div>
+            <div id="trace-logs">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Recent Errors</h2>
+            <div id="error-logs">Loading...</div>
+        </div>
+    </div>
+    
+    <script>
+        let currentFilters = {
+            search: '',
+            processor: '',
+            tag: '',
+            limit: 10
+        };
+
+        async function loadData() {
+            try {
+                await Promise.all([
+                    loadStats(),
+                    loadProcessors(),
+                    loadTraces(),
+                    loadErrors()
+                ]);
+            } catch (error) {
+                console.error('Error loading dashboard data:', error);
+                document.getElementById('quick-stats').innerHTML = '<p>Error loading data. Check console for details.</p>';
+            }
+        }
+
+        async function loadStats() {
+            const statsResponse = await fetch('/stats');
+            const statsData = await statsResponse.json();
+            
+            // System Overview
+            document.getElementById('quick-stats').innerHTML = `
+                <div class="stats-grid">
+                    <div class="stat-item"><strong>Total Processors:</strong> ${statsData.summary.total_processors}</div>
+                    <div class="stat-item"><strong>Lines Processed:</strong> ${statsData.summary.total_lines_processed}</div>
+                    <div class="stat-item"><strong>Total Errors:</strong> ${statsData.summary.total_errors}</div>
+                    <div class="stat-item"><strong>Avg Processing Time:</strong> ${statsData.summary.avg_processing_time}s</div>
+                </div>
+            `;
+
+            // Memory Stats
+            if (statsData.memory) {
+                document.getElementById('memory-stats').innerHTML = `
+                    <div class="stats-grid">
+                        <div class="memory-item"><strong>Current Memory:</strong> ${statsData.memory.current_memory_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Growth:</strong> ${statsData.memory.memory_growth_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Usage:</strong> ${statsData.memory.memory_percent.toFixed(1)}%</div>
+                        <div class="memory-item"><strong>Peak Memory:</strong> ${statsData.memory.peak_memory_mb.toFixed(1)} MB</div>
+                    </div>
+                `;
+            }
+
+            // Processor Performance
+            let processorHtml = '<div class="stats-grid">';
+            Object.entries(statsData.processors).forEach(([name, stats]) => {
+                const memUsage = stats.memory_usage_mb ? stats.memory_usage_mb.toFixed(1) : '0.0';
+                processorHtml += `
+                    <div class="stat-item">
+                        <strong>${name}</strong><br>
+                        Count: ${stats.count}<br>
+                        Avg Time: ${stats.avg_time.toFixed(4)}s<br>
+                        Errors: ${stats.errors}<br>
+                        Memory: ${memUsage} MB
+                    </div>
+                `;
+            });
+            processorHtml += '</div>';
+            document.getElementById('processor-stats').innerHTML = processorHtml;
+        }
+
+        async function loadProcessors() {
+            try {
+                const processorsResponse = await fetch('/processors');
+                const processorsData = await processorsResponse.json();
+                
+                let processorHtml = '';
+                processorsData.processors.forEach(processor => {
+                    const statusClass = processor.status === 'active' ? 'processor-item' : 'processor-item processor-idle';
+                    const statusIndicator = processor.status === 'active' ? 'status-active' : 'status-idle';
+                    const memUsage = processor.memory_usage_mb ? processor.memory_usage_mb.toFixed(1) : '0.0';
+                    
+                    processorHtml += `
+                        <div class="${statusClass}">
+                            <div>
+                                <span class="status-indicator ${statusIndicator}"></span>
+                                <strong>${processor.name}</strong>
+                                <div style="font-size: 12px; margin-top: 4px;">
+                                    ${processor.count} lines • ${processor.avg_time.toFixed(4)}s avg • ${processor.errors} errors • ${memUsage} MB
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div>${processor.status.toUpperCase()}</div>
+                                <div style="font-size: 11px;">${processor.last_seen ? new Date(processor.last_seen * 1000).toLocaleTimeString() : 'Never'}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                document.getElementById('processor-list').innerHTML = processorHtml;
+            } catch (error) {
+                document.getElementById('processor-list').innerHTML = '<p>Processor list not available</p>';
+            }
+        }
+
+        async function loadTraces() {
+            const params = new URLSearchParams();
+            if (currentFilters.search) params.append('search', currentFilters.search);
+            if (currentFilters.processor) params.append('processor', currentFilters.processor);
+            if (currentFilters.tag) params.append('tag', currentFilters.tag);
+            params.append('limit', currentFilters.limit.toString());
+
+            const tracesResponse = await fetch(`/trace?${params}`);
+            const tracesData = await tracesResponse.json();
+            
+            let traceHtml = '';
+            if (!tracesData.trace_enabled) {
+                traceHtml = '<p>Tracing is disabled. Use --trace flag to enable.</p>';
+            } else if (tracesData.traces.length === 0) {
+                traceHtml = '<p>No traces match your search criteria</p>';
+            } else {
+                tracesData.traces.forEach(trace => {
+                    const timestamp = new Date(trace.start_timestamp * 1000).toLocaleString();
+                    
+                    let stepsHtml = '';
+                    if (trace.steps && trace.steps.length > 0) {
+                        trace.steps.forEach(step => {
+                            const stepTags = step.output_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ');
+                            stepsHtml += `
+                                <div class="trace-step">
+                                    <strong>${step.processor}</strong> (${(step.processing_time * 1000).toFixed(2)}ms)<br>
+                                    Input: "${step.input_content}"<br>
+                                    Output: "${step.output_content}"<br>
+                                    Tags: ${stepTags}
+                                </div>
+                            `;
+                        });
+                    }
+                    
+                    const allTags = trace.all_tags ? trace.all_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ') : '';
+                    
+                    traceHtml += `
+                        <div class="trace-item">
+                            <div><strong>${trace.line_id}</strong> - ${timestamp}</div>
+                            <div class="trace-detail">
+                                <strong>Original:</strong> "${trace.original_content}"<br>
+                                <strong>Final:</strong> "${trace.final_content}"<br>
+                                <strong>Path:</strong> ${trace.path.join(' → ')}<br>
+                                <strong>All Tags:</strong> ${allTags}<br>
+                                <strong>Total Time:</strong> ${(trace.total_time * 1000).toFixed(2)}ms
+                            </div>
+                            ${stepsHtml ? `<div><strong>Processing Steps:</strong>${stepsHtml}</div>` : ''}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('trace-logs').innerHTML = traceHtml;
+        }
+
+        async function loadErrors() {
+            const errorsResponse = await fetch('/errors?limit=10');
+            const errorsData = await errorsResponse.json();
+            
+            let errorHtml = '';
+            if (errorsData.errors.length === 0) {
+                errorHtml = '<p>No recent errors</p>';
+            } else {
+                errorsData.errors.forEach(error => {
+                    const timestamp = new Date(error.timestamp * 1000).toLocaleString();
+                    const lineContent = error.line_content ? `<br><strong>Line:</strong> "${error.line_content}"` : '';
+                    errorHtml += `
+                        <div class="error-item">
+                            <strong>${error.processor}</strong> - ${timestamp}<br>
+                            ${error.message}${lineContent}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('error-logs').innerHTML = errorHtml;
+        }
+
+        function searchTraces() {
+            currentFilters.search = document.getElementById('search-input').value;
+            currentFilters.processor = document.getElementById('processor-filter').value;
+            currentFilters.tag = document.getElementById('tag-filter').value;
+            currentFilters.limit = parseInt(document.getElementById('limit-input').value) || 10;
+            loadTraces();
+        }
+
+        function clearFilters() {
+            currentFilters = { search: '', processor: '', tag: '', limit: 10 };
+            document.getElementById('search-input').value = '';
+            document.getElementById('processor-filter').value = '';
+            document.getElementById('tag-filter').value = '';
+            document.getElementById('limit-input').value = '10';
+            loadTraces();
+        }
+
+        // Enable Enter key for search
+        document.addEventListener('DOMContentLoaded', function() {
+            ['search-input', 'processor-filter', 'tag-filter'].forEach(id => {
+                document.getElementById(id).addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        searchTraces();
+                    }
+                });
+            });
+        });
+        
+        // Load data on page load
+        loadData();
+        
+        // Auto-refresh every 10 seconds (increased due to more complex data)
+        setInterval(loadData, 10000);
+    </script>
+</body>
+</html>
