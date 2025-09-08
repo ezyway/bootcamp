@@ -1,0 +1,1478 @@
+cli.py
+import typer
+from typing_extensions import Annotated
+from dotenv import load_dotenv
+from main import run
+import os
+
+load_dotenv()
+
+app = typer.Typer(help="Run a DAG-based line processing pipeline with observability.")
+
+@app.command()
+def main(
+    input: Annotated[str, typer.Argument()],
+    config: Annotated[
+        str,
+        typer.Option(help="Path to DAG pipeline config file (YAML). Defaults to pipeline.yaml."),
+    ] = "pipeline.yaml",
+    output: Annotated[
+        str | None,
+        typer.Option(help="Specify output file. If not specified, prints to console."),
+    ] = None,
+    trace: Annotated[
+        bool,
+        typer.Option("--trace/--no-trace", help="Enable tracing of line journeys through the DAG."),
+    ] = False,
+    dashboard: Annotated[
+        bool,
+        typer.Option("--dashboard/--no-dashboard", help="Start web dashboard for live metrics (runs on http://localhost:8000)."),
+    ] = True,
+    dashboard_port: Annotated[
+        int,
+        typer.Option(help="Port for the web dashboard."),
+    ] = 8000,
+    max_traces: Annotated[
+        int,
+        typer.Option(help="Maximum number of traces to keep in memory."),
+    ] = 1000,
+    max_errors: Annotated[
+        int,
+        typer.Option(help="Maximum number of errors to keep in memory."),
+    ] = 100,
+):
+    """
+    Run a DAG pipeline on input lines. Each processor can yield tagged lines, which
+    are routed according to the DAG config.
+    
+    The system includes built-in observability features:
+    - Real-time metrics per processor (count, timing, errors)
+    - Optional line tracing through the DAG
+    - Web dashboard with live stats, traces, and error logs
+    """
+    
+    # Set environment variable for tracing (can be used by other components)
+    if trace:
+        os.environ['TRACE_ENABLED'] = 'true'
+    else:
+        os.environ['TRACE_ENABLED'] = 'false'
+    
+    # Display startup information
+    if dashboard:
+        typer.echo(f"Starting pipeline with dashboard on http://localhost:{dashboard_port}")
+        if trace:
+            typer.echo(f"Tracing enabled - storing up to {max_traces} traces")
+        else:
+            typer.echo("Tracing disabled (use --trace to enable)")
+    else:
+        typer.echo("Starting pipeline without dashboard")
+    
+    typer.echo(f"Storing up to {max_errors} errors in memory")
+    typer.echo("=" * 60)
+    
+    # Run the main pipeline
+    run(
+        input_path=input, 
+        config_path=config, 
+        output_path=output, 
+        trace_enabled=trace,
+        dashboard_enabled=dashboard,
+        dashboard_port=dashboard_port,
+        max_traces=max_traces,
+        max_errors=max_errors
+    )
+
+if __name__ == "__main__":
+    app()
+
+
+core.py
+from typing import Iterator, Tuple, List
+from processors.base import BaseProcessor
+
+class ToUppercase(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "ERROR: " + line.upper()
+
+class ToSnakecase(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "WARN: " + line.replace(" ", "_").lower()
+
+class Trim(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            yield ["end"], "INFO: " + line.strip()
+
+
+dashboard.py
+import time
+import threading
+from typing import Optional
+from fastapi.templating import Jinja2Templates
+from fastapi import FastAPI, HTTPException, Query, Request
+from starlette.responses import JSONResponse, HTMLResponse
+import uvicorn
+from metrics import MetricsStore
+
+class DashboardServer:
+    """FastAPI-based dashboard server for DAG pipeline observability."""
+    
+    def __init__(self, metrics_store: Optional[MetricsStore] = None):
+        self.app = FastAPI(
+            title="DAG Pipeline Dashboard", 
+            version="1.0.0",
+            description="Real-time observability for DAG-based line processing pipeline"
+        )
+        self.metrics_store = metrics_store or MetricsStore.get_instance()
+        self.templates = Jinja2Templates(directory="templates")
+        self.setup_routes()
+    
+    def setup_routes(self):
+        """Configure all API routes."""
+        
+        @self.app.get("/")
+        async def root():
+            """Root endpoint with API information."""
+            return {
+                "service": "DAG Pipeline Dashboard",
+                "version": "1.0.0",
+                "description": "Real-time observability dashboard",
+                "endpoints": {
+                    "stats": "/stats - Processor statistics with memory metrics",
+                    "trace": "/trace - Enhanced line traces with search and filtering",
+                    "errors": "/errors - Recent error logs",
+                    "processors": "/processors - List all processors with status",
+                    "health": "/health - Service health check with memory stats",
+                    "dashboard": "/dashboard - HTML dashboard"
+                },
+                "trace_enabled": self.metrics_store.trace_enabled,
+                "timestamp": time.time()
+            }
+        
+        @self.app.get("/stats")
+        async def get_stats():
+            """Get current processor statistics with memory metrics."""
+            try:
+                stats = self.metrics_store.get_stats()
+                memory_stats = self.metrics_store.get_memory_stats()
+                
+                total_lines = sum(p.get("count", 0) for p in stats.values())
+                total_errors = sum(p.get("errors", 0) for p in stats.values())
+                total_time = sum(p.get("total_time", 0.0) for p in stats.values())
+                
+                return JSONResponse(content={
+                    "timestamp": time.time(),
+                    "processors": stats,
+                    "memory": memory_stats,
+                    "summary": {
+                        "total_processors": len(stats),
+                        "total_lines_processed": total_lines,
+                        "total_errors": total_errors,
+                        "total_processing_time": round(total_time, 4),
+                        "avg_processing_time": round(total_time / max(total_lines, 1), 6),
+                        "memory_usage_mb": memory_stats.get("current_memory_mb", 0),
+                        "memory_growth_mb": memory_stats.get("memory_growth_mb", 0)
+                    }
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving stats: {str(e)}")
+        
+        @self.app.get("/trace")
+        async def get_trace(
+            limit: int = Query(default=100, ge=1, le=1000, description="Maximum number of traces to return"),
+            search: str = Query(default="", description="Search in trace content"),
+            processor: str = Query(default="", description="Filter by processor name"),
+            tag: str = Query(default="", description="Filter by output tag")
+        ):
+            """Get recent line traces with enhanced search and filtering."""
+            try:
+                traces = self.metrics_store.get_traces(
+                    limit=limit, 
+                    search=search, 
+                    processor_filter=processor,
+                    tag_filter=tag
+                )
+                
+                return JSONResponse(content={
+                    "timestamp": time.time(),
+                    "traces": traces,
+                    "total_traces": len(traces),
+                    "trace_enabled": self.metrics_store.trace_enabled,
+                    "filters": {
+                        "limit": limit,
+                        "search": search,
+                        "processor": processor,
+                        "tag": tag
+                    }
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving traces: {str(e)}")
+        
+        @self.app.get("/errors")
+        async def get_errors(
+            limit: int = Query(default=50, ge=1, le=500, description="Maximum number of errors to return")
+        ):
+            """Get recent errors."""
+            try:
+                errors = self.metrics_store.get_errors(limit=limit)
+                return JSONResponse(content={
+                    "timestamp": time.time(),
+                    "errors": errors,
+                    "total_errors": len(errors),
+                    "limit": limit
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving errors: {str(e)}")
+        
+        @self.app.get("/processors")
+        async def get_processors():
+            """Get list of all processors with their status and basic metrics."""
+            try:
+                processors = self.metrics_store.get_processors()
+                stats = self.metrics_store.get_stats()
+                
+                # Enrich processor data with detailed metrics
+                enriched_processors = []
+                for proc in processors:
+                    proc_name = proc["name"]
+                    if proc_name in stats:
+                        detailed_metrics = stats[proc_name]
+                        proc.update({
+                            "total_time": detailed_metrics.get("total_time", 0.0),
+                            "memory_usage_mb": detailed_metrics.get("memory_usage_mb", 0.0)
+                        })
+                    enriched_processors.append(proc)
+                
+                return JSONResponse(content={
+                    "timestamp": time.time(),
+                    "processors": enriched_processors,
+                    "total_processors": len(enriched_processors),
+                    "active_processors": len([p for p in enriched_processors if p["status"] == "active"]),
+                    "idle_processors": len([p for p in enriched_processors if p["status"] == "idle"])
+                })
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error retrieving processors: {str(e)}")
+        
+        @self.app.get("/health")
+        async def health_check():
+            """Enhanced health check endpoint with memory statistics."""
+            try:
+                stats = self.metrics_store.get_stats()
+                memory_stats = self.metrics_store.get_memory_stats()
+                
+                return {
+                    "status": "healthy",
+                    "timestamp": time.time(),
+                    "trace_enabled": self.metrics_store.trace_enabled,
+                    "active_processors": len(stats),
+                    "uptime_seconds": time.time() - getattr(self, '_start_time', time.time()),
+                    "memory": memory_stats,
+                    "system_health": {
+                        "memory_usage_ok": memory_stats.get("memory_percent", 0) < 90,
+                        "active_traces": len(self.metrics_store._active_traces) if hasattr(self.metrics_store, '_active_traces') else 0,
+                        "stored_traces": len(self.metrics_store.traces),
+                        "stored_errors": len(self.metrics_store.errors)
+                    }
+                }
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Error in health check: {str(e)}")
+        
+        @self.app.get("/dashboard", response_class=HTMLResponse)
+        async def get_dashboard(request: Request):
+            return self.templates.TemplateResponse("dashboard.html", {"request": request})
+    
+    def start(self, host: str = "0.0.0.0", port: int = 8000) -> threading.Thread:
+        """Start the dashboard server in a background thread."""
+        self._start_time = time.time()
+        
+        def run_server():
+            uvicorn.run(
+                self.app,
+                host=host,
+                port=port,
+                log_level="error",
+                access_log=False
+            )
+        
+        self.server_thread = threading.Thread(target=run_server, daemon=True)
+        self.server_thread.start()
+        
+        # Give server a moment to start
+        time.sleep(0.5)
+        
+        return self.server_thread
+    
+    def is_running(self) -> bool:
+        """Check if the dashboard server is running."""
+        return hasattr(self, 'server_thread') and self.server_thread is not None and self.server_thread.is_alive()
+
+# Convenience functions for backwards compatibility
+def create_dashboard(metrics_store: Optional[MetricsStore] = None) -> DashboardServer:
+    """Create a new dashboard server instance."""
+    return DashboardServer(metrics_store)
+
+def start_dashboard(port: int = 8000, metrics_store: Optional[MetricsStore] = None) -> threading.Thread:
+    """Start dashboard server and return the thread."""
+    dashboard = DashboardServer(metrics_store)
+    return dashboard.start(port=port)
+
+
+main.py
+import os
+import threading
+import time
+import uvicorn
+from fastapi import FastAPI
+from starlette.responses import JSONResponse
+from typing import Iterator, Optional
+from pipeline import build_routing, run_router
+from metrics import MetricsStore
+
+def read_lines(path: str) -> Iterator[str]:
+    """Read lines from a file, stripping newlines."""
+    with open(path, "r") as file:
+        for line in file:
+            yield line.rstrip("\n")
+
+def write_output(lines: Iterator[str], output_file: Optional[str]) -> None:
+    """Write lines to a file or print to console if output_file is None."""
+    if output_file is None:
+        for line in lines:
+            print(line)
+    else:
+        output_file = os.path.abspath(os.path.expanduser(output_file))
+        os.makedirs(os.path.dirname(output_file), exist_ok=True)
+        with open(output_file, "w") as file:
+            for line in lines:
+                file.write(line + "\n")
+
+def start_dashboard_server(port: int = 8000) -> threading.Thread:
+    """Start FastAPI dashboard server in a background thread."""
+    
+    app = FastAPI(title="DAG Pipeline Dashboard", version="1.0.0")
+    metrics_store = MetricsStore.get_instance()
+    
+    @app.get("/")
+    async def root():
+        """Root endpoint with basic info."""
+        return {
+            "message": "DAG Pipeline Dashboard", 
+            "version": "1.0.0",
+            "endpoints": ["/stats", "/trace", "/errors"]
+        }
+    
+    @app.get("/stats")
+    async def get_stats():
+        """Get current processor statistics."""
+        stats = metrics_store.get_stats()
+        return JSONResponse(content={
+            "timestamp": time.time(),
+            "processors": stats,
+            "summary": {
+                "total_processors": len(stats),
+                "total_lines_processed": sum(p.get("count", 0) for p in stats.values()),
+                "total_errors": sum(p.get("errors", 0) for p in stats.values())
+            }
+        })
+    
+    @app.get("/trace")
+    async def get_trace(limit: int = 100):
+        """Get recent line traces."""
+        traces = metrics_store.get_traces(limit=limit)
+        return JSONResponse(content={
+            "timestamp": time.time(),
+            "traces": traces,
+            "total_traces": len(traces),
+            "trace_enabled": metrics_store.trace_enabled
+        })
+    
+    @app.get("/errors")
+    async def get_errors(limit: int = 50):
+        """Get recent errors."""
+        errors = metrics_store.get_errors(limit=limit)
+        return JSONResponse(content={
+            "timestamp": time.time(),
+            "errors": errors,
+            "total_errors": len(errors)
+        })
+    
+    @app.get("/health")
+    async def health_check():
+        """Health check endpoint."""
+        return {"status": "healthy", "timestamp": time.time()}
+    
+    def run_server():
+        """Run the FastAPI server with minimal logging."""
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=port, 
+            log_level="error",  # Minimize uvicorn logs
+            access_log=False    # Disable access logs
+        )
+    
+    # Start server in daemon thread
+    thread = threading.Thread(target=run_server, daemon=True)
+    thread.start()
+    
+    # Give server a moment to start
+    time.sleep(0.5)
+    return thread
+
+
+def run(
+    input_path: str, 
+    config_path: str, 
+    output_path: Optional[str],
+    trace_enabled: bool = False,
+    dashboard_enabled: bool = True,
+    dashboard_port: int = 8000,
+    max_traces: int = 1000,
+    max_errors: int = 100
+) -> None:
+    """Run the tag-based routing engine on input lines with observability."""
+    
+    # Initialize metrics store with configuration
+    metrics_store = MetricsStore.get_instance(max_traces=max_traces, max_errors=max_errors)
+    metrics_store.set_trace_enabled(trace_enabled)
+    
+    # Start dashboard if enabled - CORRECTED VERSION
+    dashboard_server = None
+    if dashboard_enabled:
+        try:
+            from dashboard import DashboardServer
+            dashboard_server = DashboardServer(metrics_store)  # Pass metrics_store explicitly
+            dashboard_thread = dashboard_server.start(port=dashboard_port)
+            print(f"Dashboard started at http://localhost:{dashboard_port}")
+            print(f"   • Stats: http://localhost:{dashboard_port}/stats")
+            print(f"   • Dashboard: http://localhost:{dashboard_port}/dashboard")
+            print(f"   • Traces: http://localhost:{dashboard_port}/trace")
+            print(f"   • Errors: http://localhost:{dashboard_port}/errors")
+            print()
+        except Exception as e:
+            print(f"Warning: Could not start dashboard: {e}")
+            print("Pipeline will continue without dashboard")
+            dashboard_enabled = False
+    
+    # Record pipeline start time
+    pipeline_start = time.time()
+    
+    try:
+        # Read input lines
+        print(f"Reading lines from: {input_path}")
+        lines = read_lines(input_path)
+        
+        # Build routing configuration
+        print(f"Building routing from: {config_path}")
+        nodes = build_routing(config_path)
+        
+        # Load start tag from config
+        import yaml
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f)
+        start_tag = cfg.get("start", "start")
+        
+        print(f"Starting pipeline at tag: {start_tag}")
+        if trace_enabled:
+            print(f"Tracing enabled (storing {max_traces} traces)")
+        
+        # Run the router
+        output_lines = run_router(start_tag, lines, nodes)
+        
+        # Write output
+        if output_path:
+            print(f"Writing output to: {output_path}")
+        else:
+            print("Writing output to console")
+        
+        write_output(output_lines, output_path)
+        
+    except Exception as e:
+        # Record pipeline-level error
+        metrics_store.record_error("pipeline", e, None)
+        print(f"Pipeline error: {e}")
+        raise
+    
+    finally:
+        # Report final statistics
+        pipeline_duration = time.time() - pipeline_start
+        stats = metrics_store.get_stats()
+        
+        print("\n" + "=" * 60)
+        print("PIPELINE SUMMARY")
+        print("=" * 60)
+        print(f"Total time: {pipeline_duration:.2f}s")
+        
+        if stats:
+            total_lines = sum(p.get("count", 0) for p in stats.values())
+            total_errors = sum(p.get("errors", 0) for p in stats.values())
+            print(f"Lines processed: {total_lines}")
+            print(f"Total errors: {total_errors}")
+            
+            print("\nProcessor Statistics:")
+            for processor, metrics in stats.items():
+                count = metrics.get("count", 0)
+                avg_time = metrics.get("avg_time", 0.0)
+                errors = metrics.get("errors", 0)
+                print(f"  • {processor}: {count} lines, {avg_time:.4f}s avg, {errors} errors")
+        
+        if dashboard_enabled and dashboard_server:
+            print(f"\nDashboard running at http://localhost:{dashboard_port}/dashboard")
+            print("Press Ctrl+C to stop")
+            
+            # Keep dashboard alive
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                print("\nShutting down...")
+
+# Legacy function signature for backwards compatibility
+def run_legacy(input_path: str, config_path: str, output_path: Optional[str]) -> None:
+    """Legacy run function for backwards compatibility."""
+    run(input_path, config_path, output_path)
+
+
+metrics.py
+import threading
+import time
+import traceback
+from collections import deque, defaultdict
+from typing import Dict, List, Any, Optional
+from dataclasses import dataclass, asdict
+import os
+import psutil  # For memory metrics
+
+@dataclass
+class TraceStep:
+    """Individual step in a line's journey"""
+    processor: str
+    input_content: str
+    output_content: str
+    output_tags: List[str]
+    timestamp: float
+    processing_time: float
+
+@dataclass
+class TraceEntry:
+    """Enhanced trace entry for a line's journey through the system"""
+    line_id: str
+    original_content: str
+    final_content: str
+    steps: List[TraceStep]
+    path: List[str]  # sequence of processor tags visited
+    all_tags: List[str]  # all output tags generated during journey
+    start_timestamp: float
+    end_timestamp: float
+    total_time: float
+
+@dataclass
+class ErrorEntry:
+    """Single error entry"""
+    processor: str
+    message: str
+    stack_trace: str
+    timestamp: float
+    line_content: Optional[str] = None
+
+@dataclass
+class ProcessorMetrics:
+    """Metrics for a single processor"""
+    count: int = 0
+    total_time: float = 0.0
+    errors: int = 0
+    avg_time: float = 0.0
+    last_seen: Optional[float] = None
+    memory_usage_mb: float = 0.0
+
+class MetricsStore:
+    """Thread-safe singleton store for all observability data"""
+    
+    _instance = None
+    _lock = threading.Lock()
+    
+    def __init__(self, max_traces: int = 1000, max_errors: int = 100):
+        self.max_traces = max_traces
+        self.max_errors = max_errors
+        
+        # Metrics per processor
+        self.metrics: Dict[str, ProcessorMetrics] = defaultdict(ProcessorMetrics)
+        
+        # Traces and errors
+        self.traces: deque = deque(maxlen=max_traces)
+        self.errors: deque = deque(maxlen=max_errors)
+        
+        # Configuration
+        self.trace_enabled = self._get_trace_config()
+        
+        # Thread safety
+        self.mutex = threading.Lock()
+        
+        # Enhanced line tracking for traces
+        self._active_traces: Dict[str, dict] = {}  # line_id -> trace_info
+        self._line_counter = 0
+        
+        # Memory tracking
+        self._process = psutil.Process()
+        self._start_memory = self._process.memory_info().rss / 1024 / 1024  # MB
+    
+    @classmethod
+    def get_instance(cls, max_traces: int = 1000, max_errors: int = 100) -> 'MetricsStore':
+        """Get singleton instance"""
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = MetricsStore(max_traces, max_errors)
+            return cls._instance
+    
+    def _get_trace_config(self) -> bool:
+        """Check if tracing is enabled via environment variable"""
+        return os.getenv('TRACE_ENABLED', 'false').lower() in ('true', '1', 'yes')
+    
+    def set_trace_enabled(self, enabled: bool):
+        """Enable/disable tracing"""
+        with self.mutex:
+            self.trace_enabled = enabled
+    
+    def start_trace(self, line_content: str) -> str:
+        """Start tracing a new line, return line_id"""
+        if not self.trace_enabled:
+            return ""
+            
+        with self.mutex:
+            self._line_counter += 1
+            line_id = f"line_{self._line_counter}"
+            self._active_traces[line_id] = {
+                'original_content': line_content,
+                'steps': [],
+                'path': [],
+                'all_tags': [],
+                'start_time': time.time()
+            }
+            return line_id
+    
+    def add_trace_step(self, line_id: str, processor_tag: str, input_content: str, 
+                      output_content: str, output_tags: List[str], processing_time: float):
+        """Add a detailed step to an active trace"""
+        if not self.trace_enabled or not line_id:
+            return
+            
+        with self.mutex:
+            if line_id in self._active_traces:
+                trace_info = self._active_traces[line_id]
+                
+                step = TraceStep(
+                    processor=processor_tag,
+                    input_content=input_content,
+                    output_content=output_content,
+                    output_tags=output_tags,
+                    timestamp=time.time(),
+                    processing_time=processing_time
+                )
+                
+                trace_info['steps'].append(step)
+                trace_info['path'].append(processor_tag)
+                trace_info['all_tags'].extend(output_tags)
+    
+    def complete_trace(self, line_id: str, final_content: str):
+        """Complete a trace and store it"""
+        if not self.trace_enabled or not line_id:
+            return
+            
+        with self.mutex:
+            if line_id in self._active_traces:
+                trace_info = self._active_traces.pop(line_id)
+                end_time = time.time()
+                total_time = end_time - trace_info['start_time']
+                
+                trace_entry = TraceEntry(
+                    line_id=line_id,
+                    original_content=trace_info['original_content'],
+                    final_content=final_content,
+                    steps=trace_info['steps'],
+                    path=trace_info['path'],
+                    all_tags=list(set(trace_info['all_tags'])),  # Remove duplicates
+                    start_timestamp=trace_info['start_time'],
+                    end_timestamp=end_time,
+                    total_time=total_time
+                )
+                self.traces.append(trace_entry)
+    
+    def record_processor_metrics(self, processor_tag: str, execution_time: float, success: bool = True):
+        """Record metrics for a processor execution"""
+        with self.mutex:
+            metrics = self.metrics[processor_tag]
+            metrics.count += 1
+            metrics.total_time += execution_time
+            metrics.avg_time = metrics.total_time / metrics.count
+            metrics.last_seen = time.time()
+            
+            # Update memory usage
+            try:
+                current_memory = self._process.memory_info().rss / 1024 / 1024  # MB
+                metrics.memory_usage_mb = current_memory - self._start_memory
+            except:
+                pass  # Ignore memory tracking errors
+            
+            if not success:
+                metrics.errors += 1
+    
+    def record_error(self, processor_tag: str, error: Exception, line_content: Optional[str] = None):
+        """Record an error"""
+        with self.mutex:
+            error_entry = ErrorEntry(
+                processor=processor_tag,
+                message=str(error),
+                stack_trace=traceback.format_exc(),
+                timestamp=time.time(),
+                line_content=line_content
+            )
+            self.errors.append(error_entry)
+            
+            # Also update processor error count
+            self.metrics[processor_tag].errors += 1
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get current statistics"""
+        with self.mutex:
+            return {
+                processor: asdict(metrics)
+                for processor, metrics in self.metrics.items()
+            }
+    
+    def get_traces(self, limit: int = 100, search: str = "", processor_filter: str = "", 
+                   tag_filter: str = "") -> List[Dict[str, Any]]:
+        """Get recent traces with search and filter capabilities"""
+        with self.mutex:
+            traces = list(self.traces)
+            
+            # Apply filters
+            if search:
+                search_lower = search.lower()
+                traces = [
+                    t for t in traces 
+                    if (search_lower in t.original_content.lower() or 
+                        search_lower in t.final_content.lower() or
+                        any(search_lower in step.input_content.lower() or 
+                            search_lower in step.output_content.lower() 
+                            for step in t.steps))
+                ]
+            
+            if processor_filter:
+                traces = [t for t in traces if processor_filter in t.path]
+            
+            if tag_filter:
+                traces = [t for t in traces if tag_filter in t.all_tags]
+            
+            # Get most recent and convert to dict
+            recent_traces = traces[-limit:] if traces else []
+            return [asdict(trace) for trace in recent_traces]
+    
+    def get_errors(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recent errors"""
+        with self.mutex:
+            errors = list(self.errors)[-limit:]
+            return [asdict(error) for error in errors]
+    
+    def get_memory_stats(self) -> Dict[str, float]:
+        """Get current memory statistics"""
+        try:
+            memory_info = self._process.memory_info()
+            return {
+                "current_memory_mb": memory_info.rss / 1024 / 1024,
+                "peak_memory_mb": memory_info.peak_wset / 1024 / 1024 if hasattr(memory_info, 'peak_wset') else 0,
+                "memory_percent": self._process.memory_percent(),
+                "start_memory_mb": self._start_memory,
+                "memory_growth_mb": (memory_info.rss / 1024 / 1024) - self._start_memory
+            }
+        except:
+            return {
+                "current_memory_mb": 0,
+                "peak_memory_mb": 0, 
+                "memory_percent": 0,
+                "start_memory_mb": 0,
+                "memory_growth_mb": 0
+            }
+    
+    def get_processors(self) -> List[Dict[str, Any]]:
+        """Get list of all processors with their basic info"""
+        with self.mutex:
+            processors = []
+            for processor_tag, metrics in self.metrics.items():
+                processors.append({
+                    "name": processor_tag,
+                    "count": metrics.count,
+                    "errors": metrics.errors,
+                    "avg_time": metrics.avg_time,
+                    "last_seen": metrics.last_seen,
+                    "status": "active" if metrics.last_seen and (time.time() - metrics.last_seen) < 60 else "idle"
+                })
+            return sorted(processors, key=lambda x: x["name"])
+    
+    def clear_metrics(self):
+        """Clear all metrics (useful for testing)"""
+        with self.mutex:
+            self.metrics.clear()
+            self.traces.clear()
+            self.errors.clear()
+            self._active_traces.clear()
+            self._line_counter = 0
+
+
+pipeline.py
+# pipeline.py
+import yaml
+import importlib
+from typing import Any, Iterator, Tuple, List, Dict
+from typez import ProcessorFn
+import networkx as nx
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from metrics import MetricsStore
+
+class ProcessorNode:
+    def __init__(self, tag: str, processor: ProcessorFn):
+        self.tag = tag
+        self.processor = processor
+        self.graph: nx.DiGraph | None = None  # optional graph reference
+        
+        # Set processor tag for metrics if it's a BaseProcessor instance
+        if hasattr(processor, 'set_processor_tag'):
+            processor.set_processor_tag(tag)
+
+def load_function(import_path: str) -> ProcessorFn:
+    module_path, name = import_path.rsplit(".", 1)
+    module = importlib.import_module(module_path)
+    obj = getattr(module, name)
+    if isinstance(obj, type):
+        obj = obj()
+    if not callable(obj):
+        raise TypeError(f"Processor '{import_path}' is not callable")
+    return obj
+
+def build_routing(config_path: str) -> Dict[str, ProcessorNode]:
+    with open(config_path, "r") as f:
+        config: dict[str, Any] = yaml.safe_load(f)
+    
+    nodes: Dict[str, ProcessorNode] = {}
+    metrics_store = MetricsStore.get_instance()
+    
+    for node_cfg in config.get("nodes", []):
+        tag = node_cfg["tag"]
+        processor = load_function(node_cfg["type"])
+        
+        # Create processor node and set tag for metrics
+        nodes[tag] = ProcessorNode(tag, processor)
+        
+        # Initialize processor metrics
+        metrics_store.record_processor_metrics(tag, 0.0, True)
+    
+    if "start" not in nodes:
+        raise ValueError("Config must include a 'start' node")
+    if "end" not in nodes:
+        raise ValueError("Config must include an 'end' node")
+    
+    graph = nx.DiGraph()
+    for tag in nodes:
+        graph.add_node(tag)
+    
+    for node_cfg in config.get("nodes", []):
+        tag = node_cfg["tag"]
+        for out_tag in node_cfg.get("routes", []):
+            if out_tag not in nodes and out_tag != "end":
+                raise KeyError(f"Node '{tag}' declares route to unknown tag '{out_tag}'")
+            graph.add_edge(tag, out_tag)
+    
+    unreachable = set(nodes) - set(nx.descendants(graph, "start")) - {"start"}
+    if unreachable:
+        print(f"Warning: unreachable nodes from 'start': {unreachable}")
+    
+    try:
+        cycles = list(nx.find_cycle(graph, orientation="original"))
+        if cycles:
+            print(f"Warning: detected cycles in routing graph: {cycles}")
+    except nx.exception.NetworkXNoCycle:
+        pass
+    
+    for node in nodes.values():
+        node.graph = graph
+    
+    return nodes
+
+def visualize_routing(nodes: Dict[str, ProcessorNode], title: str = "Routing Graph", output_file: str | None = None) -> None:
+    """
+    Visualize the routing graph using networkx and matplotlib.
+    If output_file is provided, saves the figure instead of showing it.
+    """
+    any_node = next(iter(nodes.values()))
+    graph = any_node.graph
+    if graph is None:
+        print("No graph available for visualization.")
+        return
+    
+    plt.figure(figsize=(8, 6))
+    pos = nx.spring_layout(graph)
+    nx.draw(graph, pos, with_labels=True, node_color="skyblue", node_size=2000, edge_color="gray", arrowsize=20)
+    plt.title(title)
+    
+    if output_file:
+        plt.savefig(output_file)
+        print(f"Graph saved to {output_file}")
+    else:
+        plt.show()
+
+def run_router(start_tag: str, lines: Iterator[str], nodes: Dict[str, ProcessorNode], max_hops: int = 1000) -> Iterator[str]:
+    from collections import deque
+    import time
+    
+    metrics_store = MetricsStore.get_instance()
+    
+    # Track routing-level metrics
+    routing_start_time = time.time()
+    total_lines_processed = 0
+    
+    pending = deque([(start_tag, line, 0, "") for line in lines])
+    
+    while pending:
+        tag, line, hops, line_id = pending.popleft()
+        
+        if tag == "end":
+            # Complete the trace if we have a line_id - FIXED VERSION
+            if line_id and metrics_store.trace_enabled:
+                # Provide all required parameters for enhanced add_trace_step
+                metrics_store.add_trace_step(
+                    line_id=line_id,
+                    processor_tag="end",
+                    input_content=line,
+                    output_content=line,
+                    output_tags=["end"],
+                    processing_time=0.0
+                )
+                metrics_store.complete_trace(line_id, line)
+            
+            total_lines_processed += 1
+            yield line
+            continue
+        
+        if hops > max_hops:
+            error_msg = f"Line exceeded max hops ({max_hops}) for tag '{tag}'. Possible infinite loop."
+            metrics_store.record_error("router", Exception(error_msg), line)
+            raise RuntimeError(error_msg)
+        
+        if tag not in nodes:
+            error_msg = f"Line routed to unknown tag '{tag}'. Please check processor output or config."
+            metrics_store.record_error("router", KeyError(error_msg), line)
+            raise KeyError(error_msg)
+        
+        processor_node = nodes[tag]
+        
+        try:
+            # Start trace for this line if not already started
+            if not line_id and metrics_store.trace_enabled:
+                line_id = metrics_store.start_trace(line)
+            
+            # Process the line through the current processor
+            for out_tags, out_line in processor_node.processor(iter([line])):
+                # Validate processor output
+                if not isinstance(out_tags, list):
+                    error_msg = f"Processor '{tag}' must yield a list of tags, got {type(out_tags).__name__}"
+                    metrics_store.record_error(tag, TypeError(error_msg), line)
+                    raise TypeError(error_msg)
+                
+                if not out_tags:
+                    error_msg = f"Processor '{tag}' yielded an empty list of tags. Each line must have at least one tag."
+                    metrics_store.record_error(tag, ValueError(error_msg), line)
+                    raise ValueError(error_msg)
+                
+                for out_tag in out_tags:
+                    if out_tag not in nodes and out_tag != "end":
+                        error_msg = f"Processor '{tag}' emitted unknown tag '{out_tag}'. Add it to config."
+                        metrics_store.record_error(tag, KeyError(error_msg), line)
+                        raise KeyError(error_msg)
+                    
+                    # Add to pending with the same line_id for tracing continuity
+                    pending.append((out_tag, out_line, hops + 1, line_id))
+                    
+        except Exception as e:
+            # Error already recorded by BaseProcessor, just re-raise
+            raise e
+    
+    # Record overall routing metrics
+    total_routing_time = time.time() - routing_start_time
+    print(f"Routing completed: {total_lines_processed} lines in {total_routing_time:.2f}s")
+
+
+pipeline.yaml
+start: start
+
+nodes:
+  - tag: start
+    type: processors.tagger.Tagger
+    routes:
+      - error
+      - warn
+      - trimmed
+
+  - tag: error
+    type: core.ToUppercase
+    routes:
+      - end
+
+  - tag: trimmed
+    type: core.Trim
+    routes:
+      - end
+
+  - tag: warn
+    type: core.ToSnakecase
+    routes:
+      - end
+
+  - tag: end
+    type: processors.output.Terminal
+    routes: []
+
+
+typez.py
+from typing import Iterator, Tuple, List, Callable
+
+# Each processor takes an iterator of lines and yields (tags, line) pairs
+ProcessorFn = Callable[[Iterator[str]], Iterator[Tuple[List[str], str]]]
+
+
+templates/dashboard.html
+<!DOCTYPE html>
+<html>
+<head>
+    <title>DAG Pipeline Dashboard</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .card { background: white; border-radius: 8px; padding: 20px; margin: 20px 0; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .header { background: #2c3e50; color: white; text-align: center; }
+        .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 20px; }
+        .stat-item { background: #ecf0f1; padding: 15px; border-radius: 5px; }
+        .memory-item { background: #f39c12; color: white; padding: 15px; border-radius: 5px; }
+        .error-item { background: #e74c3c; color: white; padding: 10px; margin: 5px 0; border-radius: 5px; font-size: 14px; }
+        .trace-item { background: #3498db; color: white; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        .trace-detail { background: rgba(255,255,255,0.2); margin: 8px 0; padding: 8px; border-radius: 3px; font-size: 13px; }
+        .trace-step { background: rgba(255,255,255,0.1); margin: 4px 0; padding: 6px; border-radius: 3px; font-size: 12px; }
+        .processor-item { background: #27ae60; color: white; padding: 12px; margin: 5px 0; border-radius: 5px; display: flex; justify-content: space-between; align-items: center; }
+        .processor-idle { background: #95a5a6; }
+        .search-controls { background: #34495e; color: white; padding: 15px; border-radius: 5px; margin-bottom: 10px; }
+        .search-input { width: 100%; padding: 8px; margin: 5px 0; border: none; border-radius: 3px; }
+        .filter-row { display: flex; gap: 10px; margin-top: 10px; flex-wrap: wrap; }
+        .filter-input { flex: 1; min-width: 150px; padding: 6px; border: none; border-radius: 3px; }
+        .search-btn { background: #27ae60; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .clear-btn { background: #e74c3c; color: white; padding: 8px 16px; border: none; border-radius: 3px; cursor: pointer; margin: 5px; }
+        .refresh-btn { background: #27ae60; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; }
+        .tag-badge { background: rgba(255,255,255,0.3); padding: 2px 6px; margin: 2px; border-radius: 10px; font-size: 11px; display: inline-block; }
+        pre { background: #2c3e50; color: #ecf0f1; padding: 10px; border-radius: 5px; overflow-x: auto; font-size: 12px; }
+        .status-indicator { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; }
+        .status-active { background-color: #2ecc71; }
+        .status-idle { background-color: #bdc3c7; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card header">
+            <h1>DAG Pipeline Dashboard</h1>
+            <p>Real-time observability for your processing pipeline</p>
+            <button class="refresh-btn" onclick="location.reload()">Refresh Data</button>
+        </div>
+        
+        <div class="card">
+            <h2>System Overview</h2>
+            <div id="quick-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Memory Usage</h2>
+            <div id="memory-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Active Processors</h2>
+            <div id="processor-list">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Processor Performance</h2>
+            <div id="processor-stats">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Enhanced Trace Search</h2>
+            <div class="search-controls">
+                <input type="text" id="search-input" class="search-input" placeholder="Search in trace content (input, output, steps)...">
+                <div class="filter-row">
+                    <input type="text" id="processor-filter" class="filter-input" placeholder="Filter by processor">
+                    <input type="text" id="tag-filter" class="filter-input" placeholder="Filter by tag">
+                    <input type="number" id="limit-input" class="filter-input" value="10" min="1" max="100" placeholder="Limit">
+                    <button class="search-btn" onclick="searchTraces()">Search</button>
+                    <button class="clear-btn" onclick="clearFilters()">Clear</button>
+                </div>
+            </div>
+            <div id="trace-logs">Loading...</div>
+        </div>
+        
+        <div class="card">
+            <h2>Recent Errors</h2>
+            <div id="error-logs">Loading...</div>
+        </div>
+    </div>
+    
+    <script>
+        let currentFilters = {
+            search: '',
+            processor: '',
+            tag: '',
+            limit: 10
+        };
+
+        async function loadData() {
+            try {
+                await Promise.all([
+                    loadStats(),
+                    loadProcessors(),
+                    loadTraces(),
+                    loadErrors()
+                ]);
+            } catch (error) {
+                console.error('Error loading dashboard data:', error);
+                document.getElementById('quick-stats').innerHTML = '<p>Error loading data. Check console for details.</p>';
+            }
+        }
+
+        async function loadStats() {
+            const statsResponse = await fetch('/stats');
+            const statsData = await statsResponse.json();
+            
+            // System Overview
+            document.getElementById('quick-stats').innerHTML = `
+                <div class="stats-grid">
+                    <div class="stat-item"><strong>Total Processors:</strong> ${statsData.summary.total_processors}</div>
+                    <div class="stat-item"><strong>Lines Processed:</strong> ${statsData.summary.total_lines_processed}</div>
+                    <div class="stat-item"><strong>Total Errors:</strong> ${statsData.summary.total_errors}</div>
+                    <div class="stat-item"><strong>Avg Processing Time:</strong> ${statsData.summary.avg_processing_time}s</div>
+                </div>
+            `;
+
+            // Memory Stats
+            if (statsData.memory) {
+                document.getElementById('memory-stats').innerHTML = `
+                    <div class="stats-grid">
+                        <div class="memory-item"><strong>Current Memory:</strong> ${statsData.memory.current_memory_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Growth:</strong> ${statsData.memory.memory_growth_mb.toFixed(1)} MB</div>
+                        <div class="memory-item"><strong>Memory Usage:</strong> ${statsData.memory.memory_percent.toFixed(1)}%</div>
+                        <div class="memory-item"><strong>Peak Memory:</strong> ${statsData.memory.peak_memory_mb.toFixed(1)} MB</div>
+                    </div>
+                `;
+            }
+
+            // Processor Performance
+            let processorHtml = '<div class="stats-grid">';
+            Object.entries(statsData.processors).forEach(([name, stats]) => {
+                const memUsage = stats.memory_usage_mb ? stats.memory_usage_mb.toFixed(1) : '0.0';
+                processorHtml += `
+                    <div class="stat-item">
+                        <strong>${name}</strong><br>
+                        Count: ${stats.count}<br>
+                        Avg Time: ${stats.avg_time.toFixed(4)}s<br>
+                        Errors: ${stats.errors}<br>
+                        Memory: ${memUsage} MB
+                    </div>
+                `;
+            });
+            processorHtml += '</div>';
+            document.getElementById('processor-stats').innerHTML = processorHtml;
+        }
+
+        async function loadProcessors() {
+            try {
+                const processorsResponse = await fetch('/processors');
+                const processorsData = await processorsResponse.json();
+                
+                let processorHtml = '';
+                processorsData.processors.forEach(processor => {
+                    const statusClass = processor.status === 'active' ? 'processor-item' : 'processor-item processor-idle';
+                    const statusIndicator = processor.status === 'active' ? 'status-active' : 'status-idle';
+                    const memUsage = processor.memory_usage_mb ? processor.memory_usage_mb.toFixed(1) : '0.0';
+                    
+                    processorHtml += `
+                        <div class="${statusClass}">
+                            <div>
+                                <span class="status-indicator ${statusIndicator}"></span>
+                                <strong>${processor.name}</strong>
+                                <div style="font-size: 12px; margin-top: 4px;">
+                                    ${processor.count} lines • ${processor.avg_time.toFixed(4)}s avg • ${processor.errors} errors • ${memUsage} MB
+                                </div>
+                            </div>
+                            <div style="text-align: right;">
+                                <div>${processor.status.toUpperCase()}</div>
+                                <div style="font-size: 11px;">${processor.last_seen ? new Date(processor.last_seen * 1000).toLocaleTimeString() : 'Never'}</div>
+                            </div>
+                        </div>
+                    `;
+                });
+                document.getElementById('processor-list').innerHTML = processorHtml;
+            } catch (error) {
+                document.getElementById('processor-list').innerHTML = '<p>Processor list not available</p>';
+            }
+        }
+
+        async function loadTraces() {
+            const params = new URLSearchParams();
+            if (currentFilters.search) params.append('search', currentFilters.search);
+            if (currentFilters.processor) params.append('processor', currentFilters.processor);
+            if (currentFilters.tag) params.append('tag', currentFilters.tag);
+            params.append('limit', currentFilters.limit.toString());
+
+            const tracesResponse = await fetch(`/trace?${params}`);
+            const tracesData = await tracesResponse.json();
+            
+            let traceHtml = '';
+            if (!tracesData.trace_enabled) {
+                traceHtml = '<p>Tracing is disabled. Use --trace flag to enable.</p>';
+            } else if (tracesData.traces.length === 0) {
+                traceHtml = '<p>No traces match your search criteria</p>';
+            } else {
+                tracesData.traces.forEach(trace => {
+                    const timestamp = new Date(trace.start_timestamp * 1000).toLocaleString();
+                    
+                    let stepsHtml = '';
+                    if (trace.steps && trace.steps.length > 0) {
+                        trace.steps.forEach(step => {
+                            const stepTags = step.output_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ');
+                            stepsHtml += `
+                                <div class="trace-step">
+                                    <strong>${step.processor}</strong> (${(step.processing_time * 1000).toFixed(2)}ms)<br>
+                                    Input: "${step.input_content}"<br>
+                                    Output: "${step.output_content}"<br>
+                                    Tags: ${stepTags}
+                                </div>
+                            `;
+                        });
+                    }
+                    
+                    const allTags = trace.all_tags ? trace.all_tags.map(tag => `<span class="tag-badge">${tag}</span>`).join(' ') : '';
+                    
+                    traceHtml += `
+                        <div class="trace-item">
+                            <div><strong>${trace.line_id}</strong> - ${timestamp}</div>
+                            <div class="trace-detail">
+                                <strong>Original:</strong> "${trace.original_content}"<br>
+                                <strong>Final:</strong> "${trace.final_content}"<br>
+                                <strong>Path:</strong> ${trace.path.join(' → ')}<br>
+                                <strong>All Tags:</strong> ${allTags}<br>
+                                <strong>Total Time:</strong> ${(trace.total_time * 1000).toFixed(2)}ms
+                            </div>
+                            ${stepsHtml ? `<div><strong>Processing Steps:</strong>${stepsHtml}</div>` : ''}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('trace-logs').innerHTML = traceHtml;
+        }
+
+        async function loadErrors() {
+            const errorsResponse = await fetch('/errors?limit=10');
+            const errorsData = await errorsResponse.json();
+            
+            let errorHtml = '';
+            if (errorsData.errors.length === 0) {
+                errorHtml = '<p>No recent errors</p>';
+            } else {
+                errorsData.errors.forEach(error => {
+                    const timestamp = new Date(error.timestamp * 1000).toLocaleString();
+                    const lineContent = error.line_content ? `<br><strong>Line:</strong> "${error.line_content}"` : '';
+                    errorHtml += `
+                        <div class="error-item">
+                            <strong>${error.processor}</strong> - ${timestamp}<br>
+                            ${error.message}${lineContent}
+                        </div>
+                    `;
+                });
+            }
+            document.getElementById('error-logs').innerHTML = errorHtml;
+        }
+
+        function searchTraces() {
+            currentFilters.search = document.getElementById('search-input').value;
+            currentFilters.processor = document.getElementById('processor-filter').value;
+            currentFilters.tag = document.getElementById('tag-filter').value;
+            currentFilters.limit = parseInt(document.getElementById('limit-input').value) || 10;
+            loadTraces();
+        }
+
+        function clearFilters() {
+            currentFilters = { search: '', processor: '', tag: '', limit: 10 };
+            document.getElementById('search-input').value = '';
+            document.getElementById('processor-filter').value = '';
+            document.getElementById('tag-filter').value = '';
+            document.getElementById('limit-input').value = '10';
+            loadTraces();
+        }
+
+        // Enable Enter key for search
+        document.addEventListener('DOMContentLoaded', function() {
+            ['search-input', 'processor-filter', 'tag-filter'].forEach(id => {
+                document.getElementById(id).addEventListener('keypress', function(e) {
+                    if (e.key === 'Enter') {
+                        searchTraces();
+                    }
+                });
+            });
+        });
+        
+        // Load data on page load
+        loadData();
+        
+        // Auto-refresh every 10 seconds (increased due to more complex data)
+        setInterval(loadData, 10000);
+    </script>
+</body>
+</html>
+
+
+processors/base.py
+import time
+from typing import Iterator, Tuple, List, Optional
+from metrics import MetricsStore
+
+class BaseProcessor:
+    """
+    Base class for all processors.
+    Provides a consistent interface with built-in observability.
+    """
+    
+    def __init__(self):
+        self.state = {}
+        self.metrics_store = MetricsStore.get_instance()
+        self.processor_tag = self.__class__.__name__
+    
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        """
+        Override this in subclasses.
+        Yield (tags, line) tuples for next routing step.
+        """
+        raise NotImplementedError
+    
+    def __call__(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        """
+        Wrapper that adds observability around processor execution.
+        This method handles metrics collection, tracing, and error recording.
+        """
+        for line in lines:
+            line_id = ""
+            start_time = time.time()
+            success = True
+            
+            try:
+                # Start tracing for this line if enabled
+                if self.metrics_store.trace_enabled:
+                    line_id = self.metrics_store.start_trace(line)
+                
+                # Process the single line
+                single_line_iter = iter([line])
+                results = []
+
+                # Process and collect outputs to add detailed trace steps
+                for tags, processed_line in self.process(single_line_iter):
+                    end_time = time.time()
+                    processing_time = end_time - start_time
+                    results.append((tags, processed_line))
+
+                    # If tracing enabled, add detailed step info
+                    if self.metrics_store.trace_enabled and line_id:
+                        self.metrics_store.add_trace_step(
+                            line_id=line_id,
+                            processor_tag=self.processor_tag,
+                            input_content=line,
+                            output_content=processed_line,
+                            output_tags=tags,
+                            processing_time=processing_time
+                        )
+
+                # Yield after adding all trace steps
+                for tags, processed_line in results:
+                    yield tags, processed_line
+                    
+                # Complete trace for the final output
+                if self.metrics_store.trace_enabled and line_id and results:
+                    # Use last processed line content
+                    final_content = results[-1][1]
+                    self.metrics_store.complete_trace(line_id, final_content)
+                    
+            except Exception as e:
+                success = False
+                
+                # Record the error
+                self.metrics_store.record_error(self.processor_tag, e, line)
+                
+                # Re-raise the exception to maintain existing error handling behavior
+                raise e
+                
+            finally:
+                # Record metrics for this processor execution
+                execution_time = time.time() - start_time
+                self.metrics_store.record_processor_metrics(
+                    self.processor_tag, 
+                    execution_time, 
+                    success
+                )
+
+    def set_processor_tag(self, tag: str):
+        """Allow custom processor tagging (useful for pipeline config)"""
+        self.processor_tag = tag
+
+
+# Example: LineCounter using standardized BaseProcessor
+class LineCounter(BaseProcessor):
+    def __init__(self, tag: str = "default"):
+        super().__init__()
+        self.state["count"] = 0
+        self.tag = tag
+        # Set custom processor tag for metrics
+        self.set_processor_tag(f"LineCounter_{tag}")
+
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            self.state["count"] += 1
+            yield [self.tag], f"{self.state['count']}: {line}"
+
+
+# Example: Streamify helper for stateless functions
+def streamify(fn, tag: str = "default"):
+    """
+    Wraps a stateless function into a BaseProcessor-compatible callable.
+    """
+    class StatelessProcessor(BaseProcessor):
+        def __init__(self):
+            super().__init__()
+            self.set_processor_tag(f"Streamify_{fn.__name__ if hasattr(fn, '__name__') else 'anonymous'}")
+            
+        def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+            for line in lines:
+                yield [tag], fn(line)
+    
+    return StatelessProcessor()
+
+
+processors/tagger.py
+from typing import Iterator, Tuple, List
+from processors.base import BaseProcessor
+
+class Tagger(BaseProcessor):
+    def process(self, lines: Iterator[str]) -> Iterator[Tuple[List[str], str]]:
+        for line in lines:
+            if "ERROR" in line:
+                yield ["error"], line
+            elif "WARN" in line:
+                yield ["warn"], line
+            else:
+                yield ["trimmed"], line
