@@ -116,9 +116,17 @@ def run_router(start_tag: str, lines: Iterator[str], nodes: Dict[str, ProcessorN
         tag, line, hops, line_id = pending.popleft()
         
         if tag == "end":
-            # Complete the trace if we have a line_id
+            # Complete the trace if we have a line_id - FIXED VERSION
             if line_id and metrics_store.trace_enabled:
-                metrics_store.add_trace_step(line_id, "end")
+                # Provide all required parameters for enhanced add_trace_step
+                metrics_store.add_trace_step(
+                    line_id=line_id,
+                    processor_tag="end",
+                    input_content=line,
+                    output_content=line,
+                    output_tags=["end"],
+                    processing_time=0.0
+                )
                 metrics_store.complete_trace(line_id, line)
             
             total_lines_processed += 1
