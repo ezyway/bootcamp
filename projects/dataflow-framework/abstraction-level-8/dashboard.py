@@ -6,6 +6,13 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from starlette.responses import JSONResponse, HTMLResponse
 import uvicorn
 from metrics import MetricsStore
+from pathlib import Path
+
+
+WATCH_DIR = Path("watch_dir")
+UNPROCESSED = WATCH_DIR / "unprocessed"
+UNDERPROCESS = WATCH_DIR / "underprocess"
+PROCESSED = WATCH_DIR / "processed"
 
 class DashboardServer:
     """FastAPI-based dashboard server for DAG pipeline observability."""
@@ -44,7 +51,7 @@ class DashboardServer:
         
         @self.app.get("/stats")
         async def get_stats():
-            """Get current processor statistics with memory metrics."""
+            """Get current processor statistics with memory + file queue metrics."""
             try:
                 stats = self.metrics_store.get_stats()
                 memory_stats = self.metrics_store.get_memory_stats()
@@ -52,6 +59,16 @@ class DashboardServer:
                 total_lines = sum(p.get("count", 0) for p in stats.values())
                 total_errors = sum(p.get("errors", 0) for p in stats.values())
                 total_time = sum(p.get("total_time", 0.0) for p in stats.values())
+                
+                # File queue info
+                file_stats = self.metrics_store.get_file_stats(last_n=10)
+                file_queue = {
+                    "unprocessed": len(list(UNPROCESSED.glob("*"))),
+                    "underprocess": len(list(UNDERPROCESS.glob("*"))),
+                    "processed": len(list(PROCESSED.glob("*"))),
+                    "current_file": file_stats.get("current_file"),
+                    "last_processed": file_stats.get("last_processed", [])
+                }
                 
                 return JSONResponse(content={
                     "timestamp": time.time(),
@@ -65,10 +82,12 @@ class DashboardServer:
                         "avg_processing_time": round(total_time / max(total_lines, 1), 6),
                         "memory_usage_mb": memory_stats.get("current_memory_mb", 0),
                         "memory_growth_mb": memory_stats.get("memory_growth_mb", 0)
-                    }
+                    },
+                    "file_queue": file_queue
                 })
             except Exception as e:
                 raise HTTPException(status_code=500, detail=f"Error retrieving stats: {str(e)}")
+
         
         @self.app.get("/trace")
         async def get_trace(

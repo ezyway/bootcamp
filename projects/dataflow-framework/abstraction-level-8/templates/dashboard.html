@@ -59,7 +59,21 @@
             <h2>Processor Performance</h2>
             <div id="processor-stats">Loading...</div>
         </div>
-        
+
+
+        <div class="section">
+            <h2>File Queue</h2>
+            <ul>
+                <li><strong>Unprocessed:</strong> <span id="unprocessed-count">0</span></li>
+                <li><strong>Under Process:</strong> <span id="underprocess-count">0</span></li>
+                <li><strong>Processed:</strong> <span id="processed-count">0</span></li>
+                <li><strong>Currently Processing:</strong> <span id="current-file">None</span></li>
+            </ul>
+            <h3>Last Processed Files</h3>
+            <ul id="last-processed-list"></ul>
+        </div>
+
+
         <div class="card">
             <h2>Enhanced Trace Search</h2>
             <div class="search-controls">
@@ -284,11 +298,41 @@
             });
         });
         
+
+        
         // Load data on page load
         loadData();
         
         // Auto-refresh every 10 seconds (increased due to more complex data)
         setInterval(loadData, 10000);
+        async function refreshStats() {
+            try {
+                const response = await fetch("/stats");
+                const data = await response.json();
+
+                // File queue stats
+                document.getElementById("unprocessed-count").innerText = data.file_queue.unprocessed;
+                document.getElementById("underprocess-count").innerText = data.file_queue.underprocess;
+                document.getElementById("processed-count").innerText = data.file_queue.processed;
+                document.getElementById("current-file").innerText = data.file_queue.current_file || "None";
+
+                const lastProcessedList = document.getElementById("last-processed-list");
+                lastProcessedList.innerHTML = "";
+                data.file_queue.last_processed.forEach(item => {
+                const li = document.createElement("li");
+                li.textContent = `${item.file} (${new Date(item.timestamp).toLocaleTimeString()})`;
+                lastProcessedList.appendChild(li);
+                });
+
+                // Existing memory/processor updates...
+            } catch (err) {
+                console.error("Failed to refresh stats:", err);
+            }
+            }
+
+        // Auto-refresh every 2s
+        setInterval(refreshStats, 2000);
+        refreshStats();
     </script>
 </body>
 </html>

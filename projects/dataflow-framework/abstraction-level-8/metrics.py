@@ -2,7 +2,7 @@ import threading
 import time
 import traceback
 from collections import deque, defaultdict
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 import os
 import psutil  # For memory metrics
@@ -77,9 +77,18 @@ class MetricsStore:
         self._line_counter = 0
         
         # Memory tracking
-        self._process = psutil.Process()
-        self._start_memory = self._process.memory_info().rss / 1024 / 1024  # MB
-    
+        try:
+            self._process = psutil.Process()
+            self._start_memory = self._process.memory_info().rss / 1024 / 1024  # MB
+        except Exception:
+            self._process = None
+            self._start_memory = 0.0
+
+        # File queue tracking (for Level 8)
+        self.current_file: Optional[str] = None
+        # store (filename, timestamp)
+        self._last_processed_files: deque = deque(maxlen=200)
+
     @classmethod
     def get_instance(cls, max_traces: int = 1000, max_errors: int = 100) -> 'MetricsStore':
         """Get singleton instance"""
@@ -172,9 +181,10 @@ class MetricsStore:
             
             # Update memory usage
             try:
-                current_memory = self._process.memory_info().rss / 1024 / 1024  # MB
-                metrics.memory_usage_mb = current_memory - self._start_memory
-            except:
+                if self._process is not None:
+                    current_memory = self._process.memory_info().rss / 1024 / 1024  # MB
+                    metrics.memory_usage_mb = current_memory - self._start_memory
+            except Exception:
                 pass  # Ignore memory tracking errors
             
             if not success:
@@ -240,20 +250,31 @@ class MetricsStore:
     def get_memory_stats(self) -> Dict[str, float]:
         """Get current memory statistics"""
         try:
+            if self._process is None:
+                return {
+                    "current_memory_mb": 0,
+                    "peak_memory_mb": 0, 
+                    "memory_percent": 0,
+                    "start_memory_mb": self._start_memory,
+                    "memory_growth_mb": 0
+                }
             memory_info = self._process.memory_info()
+            peak = 0
+            if hasattr(memory_info, 'peak_wset'):
+                peak = memory_info.peak_wset / 1024 / 1024
             return {
                 "current_memory_mb": memory_info.rss / 1024 / 1024,
-                "peak_memory_mb": memory_info.peak_wset / 1024 / 1024 if hasattr(memory_info, 'peak_wset') else 0,
+                "peak_memory_mb": peak,
                 "memory_percent": self._process.memory_percent(),
                 "start_memory_mb": self._start_memory,
                 "memory_growth_mb": (memory_info.rss / 1024 / 1024) - self._start_memory
             }
-        except:
+        except Exception:
             return {
                 "current_memory_mb": 0,
                 "peak_memory_mb": 0, 
                 "memory_percent": 0,
-                "start_memory_mb": 0,
+                "start_memory_mb": self._start_memory,
                 "memory_growth_mb": 0
             }
     
@@ -280,3 +301,34 @@ class MetricsStore:
             self.errors.clear()
             self._active_traces.clear()
             self._line_counter = 0
+            self.current_file = None
+            self._last_processed_files.clear()
+
+    # ------------------ File queue tracking API (Level 8) ------------------
+    def set_current_file(self, filename: Optional[str]):
+        """Set the filename currently being processed (or None)."""
+        with self.mutex:
+            self.current_file = filename
+    
+    def record_processed_file(self, filename: str):
+        """Record a file that finished processing successfully with timestamp."""
+        with self.mutex:
+            self._last_processed_files.append((filename, time.time()))
+            # clear current file if it matches
+            if self.current_file == filename:
+                self.current_file = None
+    
+    def get_file_stats(self, last_n: int = 10) -> Dict[str, Any]:
+        """Return file-related stats for dashboard consumption."""
+        with self.mutex:
+            last = list(self._last_processed_files)[-last_n:]
+            return {
+                "current_file": self.current_file,
+                "last_processed": [
+                    {"filename": fn, "timestamp": ts} for fn, ts in reversed(last)
+                ]
+            }
+
+    def list_last_processed(self, n: int = 10) -> List[Tuple[str, float]]:
+        with self.mutex:
+            return list(self._last_processed_files)[-n:]

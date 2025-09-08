@@ -10,7 +10,10 @@ app = typer.Typer(help="Run a DAG-based line processing pipeline with observabil
 
 @app.command()
 def main(
-    input: Annotated[str, typer.Argument()],
+    input: Annotated[
+        str, 
+        typer.Argument()
+        ]="",
     config: Annotated[
         str,
         typer.Option(help="Path to DAG pipeline config file (YAML). Defaults to pipeline.yaml."),
