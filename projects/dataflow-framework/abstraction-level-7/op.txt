@@ -1,0 +1,13 @@
+desktop
+dev
+documents
+downloads
+music
+personal
+pictures
+public
+public
+snap
+templates
+test_scripts
+videos

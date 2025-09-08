@@ -1,0 +1,6 @@
+  Hello World  
+This is a WARN level log
+Everything looks fine
+ERROR: Something went wrong
+Another line
+ WARN: Disk space low
