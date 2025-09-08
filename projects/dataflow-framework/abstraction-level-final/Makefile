@@ -21,11 +21,11 @@ run:
 ifndef INPUT
 	$(error INPUT variable is not set. Usage: make run INPUT=<file>)
 endif
-	$(UV) run cli.main -- --input $(INPUT) --trace --dashboard
+	$(UV) run cli.py --input $(INPUT) --trace --dashboard
 
 # Run in watch mode (monitor folder)
 run-watch:
-	$(UV) run cli.main -- --watch --trace --dashboard
+	$(UV) run cli.py --watch --trace --dashboard
 
 # Placeholder for running tests
 test:
